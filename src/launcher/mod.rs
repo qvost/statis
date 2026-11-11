@@ -77,11 +77,25 @@ impl Drop for PendingChild {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    pub intercept_io: bool,
+}
+
 /// Launches a child process in a sterile environment and retrieves its seccomp notification fd.
 ///
 /// Stops the target at exec, hides its vDSO auxv entry, then resumes under ptrace.
 /// Returns the child process PID and the seccomp notification `OwnedFd`.
 pub fn launch_child(binary_path: &Path, args: &[String]) -> Result<(Pid, OwnedFd)> {
+    launch_child_with_options(binary_path, args, &LaunchOptions::default())
+}
+
+/// Launch with optional I/O interception, retaining the same setup and cleanup.
+pub fn launch_child_with_options(
+    binary_path: &Path,
+    args: &[String],
+    options: &LaunchOptions,
+) -> Result<(Pid, OwnedFd)> {
     let c_binary = CString::new(binary_path.as_os_str().as_bytes())
         .with_context(|| format!("invalid binary path: {}", binary_path.display()))?;
 
@@ -139,7 +153,10 @@ pub fn launch_child(binary_path: &Path, args: &[String]) -> Result<(Pid, OwnedFd
             }
 
             // Install Seccomp BPF filter with SECCOMP_FILTER_FLAG_NEW_LISTENER.
-            let (_filters, fprog) = crate::interceptor::bpf::create_filter_prog();
+            let (_filters, fprog) = crate::interceptor::bpf::create_filter_prog_with_io(
+                options.intercept_io,
+                fd_pass::bootstrap_ip(),
+            );
             let notif_fd = unsafe {
                 libc::syscall(
                     libc::SYS_seccomp,
@@ -154,7 +171,7 @@ pub fn launch_child(binary_path: &Path, args: &[String]) -> Result<(Pid, OwnedFd
             }
 
             // Send notif_fd to supervisor over the child socket using fd_pass::send_fd.
-            if send_fd(child_sock.as_raw_fd(), notif_fd).is_err() {
+            if fd_pass::send_bootstrap_fd(child_sock.as_raw_fd(), notif_fd).is_err() {
                 let _ = nix::unistd::close(notif_fd);
                 unsafe { libc::_exit(1) };
             }

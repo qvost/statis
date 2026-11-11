@@ -42,6 +42,11 @@ test = false
 path = "tests/test_rdtsc.rs"
 
 [[bin]]
+name = "test_fault_injection"
+test = false
+path = "tests/test_fault_injection.rs"
+
+[[bin]]
 name = "test_epoll"
 test = false
 path = "tests/test_epoll.rs"

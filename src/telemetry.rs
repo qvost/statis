@@ -14,12 +14,36 @@ pub struct ExecutionTelemetry {
     pub syscall_counts: BTreeMap<&'static str, u64>,
     pub context_switches: u64,
     pub rdtsc_traps: u64,
+    pub faults_injected: u64,
+    pub fault_counts: BTreeMap<&'static str, u64>,
     pub exit_code: Option<i32>,
 }
 
 impl ExecutionTelemetry {
     pub fn record_syscall(&mut self, name: &'static str) {
         *self.syscall_counts.entry(name).or_default() += 1;
+    }
+
+    pub fn record_fault(&mut self, syscall_name: &'static str) {
+        self.faults_injected += 1;
+        *self.fault_counts.entry(syscall_name).or_default() += 1;
+    }
+
+    fn fault_summary(&self) -> String {
+        use std::fmt::Write;
+        let mut output = String::new();
+        if self.faults_injected > 0 {
+            writeln!(
+                output,
+                "Faults injected:     {}",
+                grouped(self.faults_injected)
+            )
+            .unwrap();
+            for (name, count) in &self.fault_counts {
+                writeln!(output, "  • {name}: {}", grouped(*count)).unwrap();
+            }
+        }
+        output
     }
 
     pub fn finish(&mut self, virtual_end_ns: u64) {
@@ -47,6 +71,7 @@ impl ExecutionTelemetry {
         for (name, count) in &self.syscall_counts {
             eprintln!("  • {name}: {}", grouped(*count));
         }
+        eprint!("{}", self.fault_summary());
         eprintln!("Hardware RDTSC traps: {}", grouped(self.rdtsc_traps));
         eprintln!("Context switches:    {}", grouped(self.context_switches));
         if let Some(code) = self.exit_code {
@@ -71,6 +96,20 @@ fn grouped(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fault_summary_groups_and_omits_empty() {
+        let mut telemetry = ExecutionTelemetry::default();
+        assert!(telemetry.fault_summary().is_empty());
+        for _ in 0..1_234 {
+            telemetry.record_fault("read");
+        }
+        telemetry.record_fault("write");
+        assert_eq!(telemetry.faults_injected, 1_235);
+        assert_eq!(
+            telemetry.fault_summary(),
+            "Faults injected:     1,235\n  • read: 1,234\n  • write: 1\n"
+        );
+    }
     #[test]
     fn records_and_finishes() {
         let mut telemetry = ExecutionTelemetry {

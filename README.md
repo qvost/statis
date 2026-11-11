@@ -43,7 +43,7 @@ cargo build --release
 ## Usage
 
 ```bash
-statis run [--seed <u64>] [--quantum <u64>] [--summary] -- <command> [args...]
+statis run [--seed <u64>] [--quantum <u64>] [--fault-rate <f64>] [--fault-types <types>] [--summary] -- <command> [args...]
 ```
 
 Example:
@@ -77,6 +77,32 @@ user    0m0.003s
 sys     0m0.022s
 ```
 
+### Deterministic Fault Injection
+
+Inject transient network and I/O failures probabilistically from the seeded PRNG:
+
+```bash
+$ statis run --seed 42 --fault-rate 0.3 -- ./target/debug/test_fault_injection
+[Fault Target] Operations: 50 | Successes: 50 | Injected faults: 50 (codes: [110, 104, 110, ...])
+==================== statis execution summary ====================
+Virtual timeline:    0.000 s
+Wall-clock elapsed:  0.017 s (0.0x time-warp speedup)
+Syscalls trapped:
+  • getrandom: 2
+  • poll: 1
+  • read: 55
+  • write: 51
+Faults injected:     38
+  • read: 17
+  • write: 21
+Hardware RDTSC traps: 0
+Context switches:    0
+Exit code:           0
+==================================================================
+```
+
+Standard streams (`stdin`, `stdout`, `stderr`) are protected from injection so console output remains undisturbed. Repeating the command with `--seed 42` reproduces the identical sequence of injected errors.
+
 ## Project Structure
 
 ```
@@ -84,16 +110,18 @@ src/
 ├── main.rs           CLI entrypoint and option parsing
 ├── lib.rs            Library exports
 ├── clock/            Monotonic virtual clock and min-heap time wheel
-├── interceptor/      Classic BPF compiler, seccomp notification ABI, futex sync, and RDTSC emulation
+├── interceptor/      Classic BPF compiler, seccomp notification ABI, futex sync, fault injection, and RDTSC emulation
 ├── launcher/         Process isolation, auxv vDSO scrubbing, and socketpair fd passing
 ├── scheduler/        PMU instruction counting (perf_event_open) and thread pool
 ├── telemetry.rs      Execution metrics and performance profiling
 └── vm.rs             Remote process memory access (process_vm_readv / writev)
 tests/
-├── test_target.rs        Multi-threaded getrandom and clock_gettime verification
-├── test_timewarp.rs      Time warping validation (10s nanosleep)
-├── test_concurrency.rs   4-thread mutex contention benchmark
-└── test_rdtsc.rs         Direct x86-64 rdtsc/rdtscp assembly trap verification
+├── test_target.rs          Multi-threaded getrandom and clock_gettime verification
+├── test_timewarp.rs        Time warping validation (10s nanosleep)
+├── test_concurrency.rs     4-thread mutex contention benchmark
+├── test_rdtsc.rs           Direct x86-64 rdtsc/rdtscp assembly trap verification
+├── test_epoll.rs           Epoll wait time warping verification
+└── test_fault_injection.rs Seed-reproducible socket/pipe fault injection
 ```
 
 ## Running Tests
