@@ -35,3 +35,8 @@ path = "tests/test_timewarp.rs"
 name = "test_concurrency"
 test = false
 path = "tests/test_concurrency.rs"
+
+[[bin]]
+name = "test_rdtsc"
+test = false
+path = "tests/test_rdtsc.rs"

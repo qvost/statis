@@ -3,7 +3,7 @@
 //! Isolates target child processes:
 //! - Neutralizes ASLR via `libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong)`
 //! - Pins execution affinity to single CPU core 0
-//! - Leaves RDTSC enabled until a trap-and-emulate handler is available
+//! - Traps RDTSC and RDTSCP with PR_SET_TSC for supervisor emulation
 //! - Sets `PR_SET_NO_NEW_PRIVS`
 //! - Installs seccomp BPF filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER`
 //! - Transmits the seccomp listener file descriptor back to the supervisor via `SCM_RIGHTS`
@@ -37,6 +37,11 @@ pub use fd_pass::{recv_fd, send_fd};
 
 fn trace_and_exec(binary: &CStr, args: &[&CStr]) -> Result<std::convert::Infallible> {
     ptrace::traceme().context("ptrace traceme")?;
+    // Enable trapping after the listener has been passed. The supervisor will
+    // service even the dynamic loader's timestamp reads after exec.
+    // SAFETY: PR_SET_TSC takes scalar arguments with no borrowed pointers.
+    Errno::result(unsafe { libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) })
+        .context("enabling TSC traps")?;
     nix::unistd::execvp(binary, args).context("executing target")
 }
 
@@ -74,7 +79,7 @@ impl Drop for PendingChild {
 
 /// Launches a child process in a sterile environment and retrieves its seccomp notification fd.
 ///
-/// Stops the target at exec, hides its vDSO auxv entry, then detaches ptrace.
+/// Stops the target at exec, hides its vDSO auxv entry, then resumes under ptrace.
 /// Returns the child process PID and the seccomp notification `OwnedFd`.
 pub fn launch_child(binary_path: &Path, args: &[String]) -> Result<(Pid, OwnedFd)> {
     let c_binary = CString::new(binary_path.as_os_str().as_bytes())
@@ -127,9 +132,6 @@ pub fn launch_child(binary_path: &Path, args: &[String]) -> Result<(Pid, OwnedFd
             if cpuset.set(0).is_err() || sched_setaffinity(Pid::from_raw(0), &cpuset).is_err() {
                 unsafe { libc::_exit(1) };
             }
-
-            // Do not enable PR_SET_TSC yet: glibc uses RDTSC during startup,
-            // and the SIGSEGV trap-and-emulate handler is not wired up.
 
             // Set no-new-privs.
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
@@ -188,7 +190,16 @@ pub fn launch_child(binary_path: &Path, args: &[String]) -> Result<(Pid, OwnedFd
             );
             let scrubbed = auxv::scrub_vdso(child).context("neutralizing target vDSO")?;
             log::debug!("child {child}: vDSO auxv entry scrubbed={scrubbed}");
-            ptrace::detach(child, None).context("ptrace detach")?;
+            ptrace::setoptions(
+                child,
+                ptrace::Options::PTRACE_O_TRACECLONE
+                    | ptrace::Options::PTRACE_O_TRACEFORK
+                    | ptrace::Options::PTRACE_O_TRACEVFORK
+                    | ptrace::Options::PTRACE_O_TRACEEXEC
+                    | ptrace::Options::PTRACE_O_EXITKILL,
+            )
+            .context("configuring ptrace thread and exec events")?;
+            ptrace::cont(child, None).context("resuming target after exec")?;
             pending_child.0 = None;
 
             Ok((child, notif_fd))

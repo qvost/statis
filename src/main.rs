@@ -18,6 +18,8 @@ enum Command {
         seed: u64,
         #[arg(long, default_value_t = 10_000)]
         quantum: u64,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        summary: bool,
         #[arg(required = true, num_args = 1.., last = true)]
         command: Vec<String>,
     },
@@ -28,12 +30,24 @@ fn run() -> Result<i32> {
         Command::Run {
             seed,
             quantum,
+            summary,
             command,
         } => {
             // The launcher accepts argv including argv[0]; preserve all target arguments.
             let (child, listener) =
                 statis::launcher::launch_child(Path::new(&command[0]), &command)?;
-            statis::supervisor::run_supervisor(child, listener, seed, quantum)
+            let mut telemetry = statis::telemetry::ExecutionTelemetry::default();
+            let result = statis::supervisor::run_supervisor_with_telemetry(
+                child,
+                listener,
+                seed,
+                quantum,
+                &mut telemetry,
+            );
+            if summary {
+                telemetry.print_summary();
+            }
+            result
         }
     }
 }

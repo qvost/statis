@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use nix::{
     errno::Errno,
     sys::{
+        ptrace,
         signal::{Signal, kill},
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
@@ -22,20 +23,24 @@ use crate::{
     clock::{TimeWheel, TimerEvent, VirtualClock},
     interceptor::{
         FutexManager, FutexWaiter, SECCOMP_USER_NOTIF_FLAG_CONTINUE, is_id_valid,
-        recv_notification, seccomp_notif, seccomp_notif_resp, send_response,
+        recv_notification, seccomp_notif, seccomp_notif_resp, send_response, tsc,
     },
     scheduler::{DeterministicScheduler, ThreadState as SchedulerThreadState, pmu},
+    telemetry::ExecutionTelemetry,
     vm,
 };
 
 struct State {
     rng: ChaCha20Rng,
     scheduler: DeterministicScheduler,
+    telemetry: ExecutionTelemetry,
     clock: VirtualClock,
     wheel: TimeWheel,
     threads: BTreeMap<Pid, ThreadState>,
     futex_mgr: FutexManager,
     pending_responses: VecDeque<seccomp_notif_resp>,
+    tracees: BTreeSet<Pid>,
+    new_tracees: BTreeSet<Pid>,
 }
 
 trait MemoryReader {
@@ -91,11 +96,14 @@ impl State {
         Self {
             rng: ChaCha20Rng::seed_from_u64(seed),
             scheduler: DeterministicScheduler::new(seed, quantum),
+            telemetry: ExecutionTelemetry::default(),
             clock: VirtualClock::default(),
             wheel: TimeWheel::default(),
             threads: BTreeMap::new(),
             futex_mgr: FutexManager::default(),
             pending_responses: VecDeque::new(),
+            tracees: BTreeSet::new(),
+            new_tracees: BTreeSet::new(),
         }
     }
 
@@ -266,6 +274,17 @@ impl State {
         notif: &seccomp_notif,
         read: &mut impl MemoryReader,
     ) -> nix::Result<Option<seccomp_notif_resp>> {
+        let name = match i64::from(notif.data.nr) {
+            libc::SYS_sched_yield => "sched_yield",
+            libc::SYS_futex => "futex",
+            libc::SYS_getrandom => "getrandom",
+            libc::SYS_clock_gettime => "clock_gettime",
+            libc::SYS_clock_nanosleep => "clock_nanosleep",
+            libc::SYS_nanosleep => "nanosleep",
+            libc::SYS_gettimeofday => "gettimeofday",
+            _ => "other",
+        };
+        self.telemetry.record_syscall(name);
         // pid is the notifying thread ID, which can differ from the launched PID.
         let pid = Pid::from_raw(notif.pid as i32);
         let args = notif.data.args;
@@ -451,7 +470,9 @@ fn task_is_runnable(stat: &str) -> io::Result<bool> {
     let (_, fields) = stat
         .rsplit_once(") ")
         .ok_or_else(|| io::Error::other("invalid task stat"))?;
-    Ok(fields.starts_with('R'))
+    // A ptrace stop is work pending in the supervisor, not an idle sleeper.
+    // Keep it runnable so a timer warp cannot skip an unprocessed TSC fault.
+    Ok(fields.starts_with('R') || fields.starts_with('t'))
 }
 
 fn thread_snapshot(child: Pid) -> io::Result<BTreeMap<Pid, bool>> {
@@ -487,16 +508,142 @@ fn errno(error: &anyhow::Error) -> Option<i32> {
         .and_then(io::Error::raw_os_error)
 }
 
-fn child_status(child: Pid, flags: Option<WaitPidFlag>) -> nix::Result<Option<i32>> {
-    loop {
-        match waitpid(child, flags) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(Some(code)),
-            Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(Some(128 + signal as i32)),
-            Ok(_) => return Ok(None),
-            Err(Errno::EINTR) => continue,
-            Err(error) => return Err(error),
+fn handle_signal_stop(
+    state: &mut State,
+    tid: Pid,
+    signal: Signal,
+    initial_stop: bool,
+    emulate_tsc: impl FnOnce(Pid, u64) -> Result<bool>,
+    resume: impl FnOnce(Pid, Option<Signal>) -> nix::Result<()>,
+) -> Result<()> {
+    let deliver = if signal == Signal::SIGSEGV {
+        anyhow::ensure!(
+            emulate_tsc(tid, state.clock.now_ns())?,
+            "thread {tid} received a genuine SIGSEGV (instruction is not RDTSC/RDTSCP)"
+        );
+        // Clock reads retain their 100 ns tick. Timestamp faults cost 50 ns.
+        state
+            .clock
+            .advance_to(state.clock.now_ns().saturating_add(50));
+        state.threads.insert(tid, ThreadState::Runnable);
+        None
+    } else if initial_stop && signal == Signal::SIGSTOP {
+        // Auto-attached clone/fork children start with a synthetic SIGSTOP.
+        None
+    } else {
+        Some(signal)
+    };
+    resume(tid, deliver).context("resuming ptrace signal stop")
+}
+
+fn drain_wait_events(child: Pid, state: &mut State) -> Result<Option<i32>> {
+    // Bound each drain so a tight RDTSC loop cannot starve seccomp responses.
+    for _ in 0..64 {
+        let mut progress = false;
+        // Wait only for this runtime's tasks; waitpid(-1) could steal unrelated
+        // children, including children owned by concurrent library tests.
+        for tid in state.tracees.iter().copied().collect::<Vec<_>>() {
+            let status = match waitpid(tid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::__WALL)) {
+                Ok(WaitStatus::StillAlive) => continue,
+                Ok(status) => status,
+                Err(Errno::EINTR) => {
+                    progress = true;
+                    continue;
+                }
+                Err(Errno::ECHILD | Errno::ESRCH) if tid != child => {
+                    state.tracees.remove(&tid);
+                    state.new_tracees.remove(&tid);
+                    continue;
+                }
+                Err(error) => return Err(error).context("waiting for supervised task"),
+            };
+            progress = true;
+            match status {
+                WaitStatus::Exited(pid, code) => {
+                    state.tracees.remove(&pid);
+                    state.new_tracees.remove(&pid);
+                    if pid == child {
+                        return Ok(Some(code));
+                    }
+                }
+                WaitStatus::Signaled(pid, signal, _) => {
+                    state.tracees.remove(&pid);
+                    state.new_tracees.remove(&pid);
+                    if pid == child {
+                        return Ok(Some(128 + signal as i32));
+                    }
+                }
+                WaitStatus::Stopped(pid, signal) => {
+                    let initial_stop = state.new_tracees.remove(&pid);
+                    handle_signal_stop(
+                        state,
+                        pid,
+                        signal,
+                        initial_stop,
+                        tsc::handle_tsc_fault,
+                        |pid, signal| ptrace::cont(pid, signal),
+                    )?;
+                }
+                WaitStatus::PtraceEvent(pid, _, event) => {
+                    if matches!(
+                        event,
+                        libc::PTRACE_EVENT_CLONE
+                            | libc::PTRACE_EVENT_FORK
+                            | libc::PTRACE_EVENT_VFORK
+                    ) {
+                        let new_tid = i32::try_from(ptrace::getevent(pid)?)
+                            .context("ptrace child TID does not fit pid_t")?;
+                        let new_tid = Pid::from_raw(new_tid);
+                        state.tracees.insert(new_tid);
+                        state.new_tracees.insert(new_tid);
+                    }
+                    // Exec events and clone events are synthetic traps, not
+                    // application SIGTRAP signals, so do not reinject SIGTRAP.
+                    ptrace::cont(pid, None).context("resuming ptrace event")?;
+                }
+                WaitStatus::PtraceSyscall(pid) => ptrace::cont(pid, None)?,
+                _ => (),
+            }
+        }
+        if !progress {
+            return Ok(None);
         }
     }
+    Ok(None)
+}
+
+fn kill_and_reap(child: Pid, state: &mut State) {
+    // Include tasks whose clone event may not yet have been drained.
+    if let Ok(tasks) = thread_snapshot(child) {
+        state.tracees.extend(tasks.keys().copied());
+    }
+    state.tracees.insert(child);
+    for tid in &state.tracees {
+        let _ = kill(*tid, Signal::SIGKILL);
+    }
+    // Reap traced workers before the leader, which can wait for their deaths.
+    let mut tids: Vec<_> = state
+        .tracees
+        .iter()
+        .copied()
+        .filter(|tid| *tid != child)
+        .collect();
+    tids.push(child);
+    for tid in tids {
+        loop {
+            match waitpid(tid, Some(WaitPidFlag::__WALL)) {
+                Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..))
+                | Err(Errno::ECHILD | Errno::ESRCH) => break,
+                Err(Errno::EINTR) => continue,
+                Err(_) => break,
+                Ok(_) => {
+                    let _ = ptrace::cont(tid, Some(Signal::SIGKILL));
+                }
+            }
+        }
+    }
+    state.tracees.clear();
+    state.new_tracees.clear();
 }
 
 fn poll_listener(fd: RawFd, timeout_ms: i32) -> Result<i16> {
@@ -541,11 +688,6 @@ fn flush_responses(state: &mut State, fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-fn supervise(child: Pid, notif_fd: &OwnedFd, seed: u64, quantum: u64) -> Result<i32> {
-    let mut state = State::new(seed, quantum);
-    supervise_loop(child, notif_fd, &mut state, State::emulate)
-}
-
 fn supervise_loop(
     child: Pid,
     notif_fd: &OwnedFd,
@@ -553,8 +695,9 @@ fn supervise_loop(
     mut emulate: impl FnMut(&mut State, &seccomp_notif) -> nix::Result<Option<seccomp_notif_resp>>,
 ) -> Result<i32> {
     let fd = notif_fd.as_raw_fd();
+    state.tracees.insert(child);
     loop {
-        if let Some(code) = child_status(child, Some(WaitPidFlag::WNOHANG))? {
+        if let Some(code) = drain_wait_events(child, state)? {
             return Ok(code);
         }
 
@@ -569,7 +712,12 @@ fn supervise_loop(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error).context("reading child thread states"),
             }
+            // A thread can fault while the task snapshot is being collected.
+            if let Some(code) = drain_wait_events(child, state)? {
+                return Ok(code);
+            }
             state.cancel_invalid_notifications(|id| is_id_valid(fd, id));
+            wake_expired(state, fd)?;
             // Exit wakes must be delivered even for joins with no timeout.
             flush_responses(state, fd)?;
             // Task states and notification readiness are sampled separately.
@@ -583,25 +731,15 @@ fn supervise_loop(
         if revents == 0 {
             // Bound exit detection and refresh task states promptly for virtual
             // timer warps and implicit kernel futex wakes on thread exit.
-            revents = poll_listener(
-                fd,
-                if state.wheel.is_empty() && state.futex_mgr.is_empty() {
-                    50
-                } else {
-                    1
-                },
-            )?;
+            // Ptrace signal stops need service even without a seccomp request.
+            revents = poll_listener(fd, 1)?;
         }
         if revents == 0 {
             continue;
         }
         if revents & libc::POLLHUP != 0 {
-            // No filtered tasks remain. Reap the launched child.
-            loop {
-                if let Some(code) = child_status(child, None)? {
-                    return Ok(code);
-                }
-            }
+            // Drain final ptrace events and exits on the next iteration.
+            continue;
         }
         anyhow::ensure!(
             revents & (libc::POLLERR | libc::POLLNVAL) == 0,
@@ -642,12 +780,36 @@ fn supervise_loop(
 /// Supervise intercepted syscalls and reap the child, returning its exit code.
 /// Signal deaths use the shell convention of 128 plus the signal number.
 pub fn run_supervisor(child: Pid, notif_fd: OwnedFd, seed: u64, quantum: u64) -> Result<i32> {
-    let result = supervise(child, &notif_fd, seed, quantum);
-    if result.is_err() {
-        // A failed supervisor must not leave its target blocked in a syscall.
-        let _ = kill(child, Signal::SIGKILL);
-        let _ = child_status(child, None);
+    run_supervisor_with_telemetry(
+        child,
+        notif_fd,
+        seed,
+        quantum,
+        &mut ExecutionTelemetry::default(),
+    )
+}
+
+/// Run the supervisor and return execution statistics, including on errors.
+pub fn run_supervisor_with_telemetry(
+    child: Pid,
+    notif_fd: OwnedFd,
+    seed: u64,
+    quantum: u64,
+    telemetry: &mut ExecutionTelemetry,
+) -> Result<i32> {
+    let mut state = State::new(seed, quantum);
+    state.telemetry = std::mem::take(telemetry);
+    if state.telemetry.real_start.is_none() {
+        state.telemetry.real_start = Some(std::time::Instant::now());
     }
+    state.telemetry.virtual_start_ns = state.clock.now_ns();
+    let result = supervise_loop(child, &notif_fd, &mut state, State::emulate);
+    if result.is_err() {
+        kill_and_reap(child, &mut state);
+    }
+    state.telemetry.exit_code = result.as_ref().ok().copied();
+    state.telemetry.finish(state.clock.now_ns());
+    *telemetry = state.telemetry;
     result
 }
 
@@ -655,6 +817,117 @@ pub fn run_supervisor(child: Pid, notif_fd: OwnedFd, seed: u64, quantum: u64) ->
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn timestamp_faults_advance_fifty_ns_and_resume_without_sigsegv() {
+        let mut state = State::new(0, 10_000);
+        let tid = Pid::from_raw(123);
+        for expected_cycles in [0, 50] {
+            handle_signal_stop(
+                &mut state,
+                tid,
+                Signal::SIGSEGV,
+                false,
+                |pid, cycles| {
+                    assert_eq!((pid, cycles), (tid, expected_cycles));
+                    Ok(true)
+                },
+                |pid, signal| {
+                    assert_eq!((pid, signal), (tid, None));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(state.clock.now_ns(), 100);
+        assert_eq!(state.threads[&tid], ThreadState::Runnable);
+        assert_eq!(state.clock.advance_tick(), 200); // normal clock reads keep their tick
+    }
+
+    #[test]
+    fn real_sigsegv_is_an_error_and_is_not_resumed() {
+        let mut state = State::new(0, 10_000);
+        let error = handle_signal_stop(
+            &mut state,
+            Pid::from_raw(123),
+            Signal::SIGSEGV,
+            false,
+            |_, _| Ok(false),
+            |_, _| panic!("must not resume a genuine fault"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("genuine SIGSEGV"));
+        assert_eq!(state.clock.now_ns(), 0);
+    }
+
+    #[test]
+    fn tsc_inspection_and_resume_errors_propagate() {
+        let mut state = State::new(0, 10_000);
+        let error = handle_signal_stop(
+            &mut state,
+            Pid::from_raw(123),
+            Signal::SIGSEGV,
+            false,
+            |_, _| Err(Errno::EFAULT.into()),
+            |_, _| panic!("inspection failed"),
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EFAULT));
+        assert_eq!(state.clock.now_ns(), 0);
+        let error = handle_signal_stop(
+            &mut state,
+            Pid::from_raw(123),
+            Signal::SIGSEGV,
+            false,
+            |_, _| Ok(true),
+            |_, _| Err(Errno::ESRCH),
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::ESRCH));
+    }
+
+    #[test]
+    fn forwards_signals_but_suppresses_initial_clone_stop() {
+        let mut state = State::new(0, 10_000);
+        for (signal, initial, expected) in [
+            (Signal::SIGSTOP, true, None),
+            (Signal::SIGTERM, false, Some(Signal::SIGTERM)),
+            (Signal::SIGTRAP, false, Some(Signal::SIGTRAP)),
+        ] {
+            handle_signal_stop(
+                &mut state,
+                Pid::from_raw(123),
+                signal,
+                initial,
+                |_, _| panic!("not a timestamp fault"),
+                |_, delivered| {
+                    assert_eq!(delivered, expected);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(state.clock.now_ns(), 0);
+    }
+
+    #[test]
+    fn timestamp_fault_at_end_of_timeline_does_not_wrap() {
+        let mut state = State::new(0, 10_000);
+        state.clock.advance_to(u64::MAX - 25);
+        handle_signal_stop(
+            &mut state,
+            Pid::from_raw(123),
+            Signal::SIGSEGV,
+            false,
+            |_, cycles| {
+                assert_eq!(cycles, u64::MAX - 25);
+                Ok(true)
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(state.clock.now_ns(), u64::MAX);
+    }
 
     fn notification(nr: i64, args: [u64; 6]) -> seccomp_notif {
         seccomp_notif {
@@ -1459,6 +1732,7 @@ mod tests {
     #[test]
     fn proc_task_states_handle_names_with_parentheses() {
         assert!(task_is_runnable("1 (a ) tricky (name)) R 0 1").unwrap());
+        assert!(task_is_runnable("1 (timestamp fault) t 0 1").unwrap());
         for status in ['S', 'D', 'T', 'Z'] {
             assert!(!task_is_runnable(&format!("1 (thread name) {status} 0 1")).unwrap());
         }

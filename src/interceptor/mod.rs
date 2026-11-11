@@ -3,6 +3,7 @@
 pub mod bpf;
 pub mod notif;
 pub mod sync;
+pub mod tsc;
 
 pub use bpf::create_filter_prog;
 pub use notif::{
