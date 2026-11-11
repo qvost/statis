@@ -2,8 +2,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs, io,
+    fs::{self, File},
+    io::{self, BufReader, BufWriter},
     os::fd::{AsRawFd, OwnedFd, RawFd},
+    path::PathBuf,
 };
 
 use anyhow::{Context, Result};
@@ -27,19 +29,33 @@ use crate::{
     },
     scheduler::{DeterministicScheduler, ThreadState as SchedulerThreadState, pmu},
     telemetry::ExecutionTelemetry,
+    trace::{TraceEvent, TraceHeader, TraceReader, TraceWriter},
     vm,
 };
+
+#[derive(Debug, Clone, Default)]
+pub enum TraceMode {
+    #[default]
+    None,
+    Record(PathBuf),
+    Replay(PathBuf),
+}
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
     pub seed: u64,
     pub quantum: u64,
     pub fault_config: FaultConfig,
+    pub trace_mode: TraceMode,
+    pub command: Vec<String>,
 }
 
 struct State {
     rng: ChaCha20Rng,
     fault_config: FaultConfig,
+    trace_writer: Option<TraceWriter<BufWriter<File>>>,
+    trace_reader: Option<TraceReader<BufReader<File>>>,
+    trace_notifications: BTreeMap<u64, seccomp_notif>,
     scheduler: DeterministicScheduler,
     telemetry: ExecutionTelemetry,
     clock: VirtualClock,
@@ -99,11 +115,38 @@ impl ThreadState {
     }
 }
 
+fn syscall_matches(expected_nr: i32, expected_args: &[u64; 6], nr: i32, args: &[u64; 6]) -> bool {
+    if expected_nr != nr {
+        return false;
+    }
+    match i64::from(nr) {
+        libc::SYS_clock_gettime => expected_args[0] == args[0],
+        libc::SYS_getrandom => expected_args[1] == args[1] && expected_args[2] == args[2],
+        libc::SYS_nanosleep | libc::SYS_clock_nanosleep => true,
+        libc::SYS_poll => expected_args[1] == args[1] && expected_args[2] == args[2],
+        libc::SYS_epoll_wait | libc::SYS_epoll_pwait => {
+            expected_args[0] == args[0]
+                && expected_args[2] == args[2]
+                && expected_args[3] == args[3]
+        }
+        libc::SYS_read | libc::SYS_write => {
+            expected_args[0] == args[0] && expected_args[2] == args[2]
+        }
+        libc::SYS_futex => {
+            (expected_args[1] & 0x7f) == (args[1] & 0x7f) && expected_args[2] == args[2]
+        }
+        _ => expected_args == args,
+    }
+}
+
 impl State {
     fn new(seed: u64, quantum: u64, fault_config: FaultConfig) -> Self {
         Self {
             rng: ChaCha20Rng::seed_from_u64(seed),
             fault_config,
+            trace_writer: None,
+            trace_reader: None,
+            trace_notifications: BTreeMap::new(),
             scheduler: DeterministicScheduler::new(seed, quantum),
             telemetry: ExecutionTelemetry::default(),
             clock: VirtualClock::default(),
@@ -114,6 +157,91 @@ impl State {
             tracees: BTreeSet::new(),
             new_tracees: BTreeSet::new(),
         }
+    }
+
+    fn trace_event(&mut self, event: TraceEvent) -> Result<TraceEvent> {
+        if let Some(writer) = &mut self.trace_writer {
+            writer.write_event(&event).context("writing trace")?;
+        }
+        if let Some(reader) = &mut self.trace_reader {
+            let expected = reader
+                .next_event()
+                .context("reading trace")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Replay divergence at virtual time {}ns: trace ended before {:?}",
+                        self.clock.now_ns(),
+                        event
+                    )
+                })?;
+            match (&expected, &event) {
+                (
+                    TraceEvent::Syscall {
+                        tid: expected_tid,
+                        nr: expected_nr,
+                        args: expected_args,
+                        ..
+                    },
+                    TraceEvent::Syscall { tid, nr, args, .. },
+                ) => {
+                    anyhow::ensure!(
+                        syscall_matches(*expected_nr, expected_args, *nr, args),
+                        "Replay divergence at virtual time {}ns: expected syscall {} on tid {} with args {:?}, but received {} on tid {} with args {:?}",
+                        self.clock.now_ns(),
+                        expected_nr,
+                        expected_tid,
+                        expected_args,
+                        nr,
+                        tid,
+                        args
+                    );
+                }
+                (TraceEvent::Rdtsc { .. }, TraceEvent::Rdtsc { .. }) => (),
+                (
+                    TraceEvent::ThreadExit { exit_code: a, .. },
+                    TraceEvent::ThreadExit { exit_code: b, .. },
+                ) if a == b => (),
+                _ => anyhow::bail!(
+                    "Replay divergence at virtual time {}ns: expected {:?}, received {:?}",
+                    self.clock.now_ns(),
+                    expected,
+                    event
+                ),
+            }
+            return Ok(expected);
+        }
+        Ok(event)
+    }
+
+    fn trace_response(&mut self, response: &mut seccomp_notif_resp) -> Result<()> {
+        if self.trace_reader.is_none() && self.trace_writer.is_none() {
+            return Ok(());
+        }
+        let notif = self
+            .trace_notifications
+            .remove(&response.id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing notification {} for trace response", response.id)
+            })?;
+        let event = TraceEvent::Syscall {
+            tid: notif.pid,
+            nr: notif.data.nr,
+            args: notif.data.args,
+            virtual_time_ns: self.clock.now_ns(),
+            return_val: response.val,
+            error: response.error,
+        };
+        if let TraceEvent::Syscall {
+            return_val, error, ..
+        } = self.trace_event(event)?
+        {
+            response.val = return_val;
+            response.error = error;
+            if error != 0 {
+                response.flags = 0;
+            }
+        }
+        Ok(())
     }
 
     fn register_thread(&mut self, tid: Pid) {
@@ -586,6 +714,21 @@ fn handle_signal_stop(
             emulate_tsc(tid, state.clock.now_ns())?,
             "thread {tid} received a genuine SIGSEGV (instruction is not RDTSC/RDTSCP)"
         );
+        let value = state.clock.now_ns();
+        let event = state.trace_event(TraceEvent::Rdtsc {
+            tid: tid.as_raw() as u32,
+            virtual_cycles: value,
+        })?;
+        if let TraceEvent::Rdtsc {
+            virtual_cycles: expected,
+            ..
+        } = event
+        {
+            anyhow::ensure!(
+                expected == value,
+                "Replay divergence at virtual time {value}ns: expected RDTSC value {expected}"
+            );
+        }
         // Clock reads retain their 100 ns tick. Timestamp faults cost 50 ns.
         state
             .clock
@@ -625,6 +768,10 @@ fn drain_wait_events(child: Pid, state: &mut State) -> Result<Option<i32>> {
             progress = true;
             match status {
                 WaitStatus::Exited(pid, code) => {
+                    state.trace_event(TraceEvent::ThreadExit {
+                        tid: pid.as_raw() as u32,
+                        exit_code: code,
+                    })?;
                     state.tracees.remove(&pid);
                     state.new_tracees.remove(&pid);
                     if pid == child {
@@ -632,6 +779,10 @@ fn drain_wait_events(child: Pid, state: &mut State) -> Result<Option<i32>> {
                     }
                 }
                 WaitStatus::Signaled(pid, signal, _) => {
+                    state.trace_event(TraceEvent::ThreadExit {
+                        tid: pid.as_raw() as u32,
+                        exit_code: 128 + signal as i32,
+                    })?;
                     state.tracees.remove(&pid);
                     state.new_tracees.remove(&pid);
                     if pid == child {
@@ -746,9 +897,9 @@ fn wake_expired(state: &mut State, fd: RawFd) -> Result<()> {
 }
 
 fn flush_responses(state: &mut State, fd: RawFd) -> Result<()> {
-    while let Some(response) = state.pending_responses.front() {
-        reply(fd, response)?;
-        state.pending_responses.pop_front();
+    while let Some(mut response) = state.pending_responses.pop_front() {
+        state.trace_response(&mut response)?;
+        reply(fd, &response)?;
     }
     Ok(())
 }
@@ -824,6 +975,11 @@ fn supervise_loop(
         if !is_id_valid(fd, notification.id) {
             continue;
         }
+        if state.trace_writer.is_some() || state.trace_reader.is_some() {
+            state
+                .trace_notifications
+                .insert(notification.id, notification);
+        }
         state.begin_notification(&notification);
         let response = match emulate(state, &notification) {
             Ok(response) => response,
@@ -835,7 +991,8 @@ fn supervise_loop(
         };
         // Wake queued futex waiters before returning the count to the waker.
         flush_responses(state, fd)?;
-        if let Some(response) = response {
+        if let Some(mut response) = response {
+            state.trace_response(&mut response)?;
             reply(fd, &response)?;
         }
         wake_expired(state, fd)?;
@@ -869,6 +1026,8 @@ pub fn run_supervisor_with_telemetry(
             seed,
             quantum,
             fault_config: FaultConfig::default(),
+            trace_mode: TraceMode::None,
+            command: Vec::new(),
         },
         telemetry,
     )
@@ -880,13 +1039,61 @@ pub fn run_supervisor_with_config(
     config: SupervisorConfig,
     telemetry: &mut ExecutionTelemetry,
 ) -> Result<i32> {
+    let trace_header = TraceHeader {
+        seed: config.seed,
+        quantum: config.quantum,
+        fault_rate: config.fault_config.fault_rate,
+        command: config.command,
+    };
     let mut state = State::new(config.seed, config.quantum, config.fault_config);
+    let setup = (|| -> Result<()> {
+        match config.trace_mode {
+            TraceMode::None => (),
+            TraceMode::Record(path) => {
+                state.trace_writer = Some(TraceWriter::new(
+                    BufWriter::new(File::create(path).context("creating trace")?),
+                    trace_header,
+                )?)
+            }
+            TraceMode::Replay(path) => {
+                state.trace_reader = Some(TraceReader::new(BufReader::new(
+                    File::open(path).context("opening trace")?,
+                ))?)
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = setup {
+        state.tracees.insert(child);
+        kill_and_reap(child, &mut state);
+        return Err(error);
+    }
     state.telemetry = std::mem::take(telemetry);
     if state.telemetry.real_start.is_none() {
         state.telemetry.real_start = Some(std::time::Instant::now());
     }
     state.telemetry.virtual_start_ns = state.clock.now_ns();
-    let result = supervise_loop(child, &notif_fd, &mut state, State::emulate);
+    let mut result = supervise_loop(child, &notif_fd, &mut state, State::emulate);
+    if result.is_ok()
+        && let Some(reader) = &mut state.trace_reader
+    {
+        match reader.next_event() {
+            Ok(None) => (),
+            Ok(Some(event)) => {
+                result = Err(anyhow::anyhow!(
+                    "Replay divergence: unconsumed event {:?}",
+                    event
+                ))
+            }
+            Err(error) => result = Err(error.into()),
+        }
+    }
+    if let Some(writer) = &mut state.trace_writer
+        && let Err(error) = writer.flush()
+        && result.is_ok()
+    {
+        result = Err(error.into());
+    }
     if result.is_err() {
         kill_and_reap(child, &mut state);
     }
@@ -1344,6 +1551,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.clock.now_ns(), u64::MAX);
+    }
+
+    #[test]
+    fn trace_replays_responses_and_detects_argument_divergence() {
+        let path = std::env::temp_dir().join(format!("statis-trace-unit-{}", std::process::id()));
+        let mut writer = TraceWriter::new(
+            BufWriter::new(File::create(&path).unwrap()),
+            TraceHeader {
+                seed: 0,
+                quantum: 10_000,
+                fault_rate: 0.0,
+                command: Vec::new(),
+            },
+        )
+        .unwrap();
+        let event = TraceEvent::Syscall {
+            tid: 1,
+            nr: libc::SYS_read as i32,
+            args: [4, 5, 6, 0, 0, 0],
+            virtual_time_ns: 0,
+            return_val: 17,
+            error: 0,
+        };
+        writer.write_event(&event).unwrap();
+        writer.write_event(&event).unwrap();
+        writer.flush().unwrap();
+        let mut state = State::new(0, 10_000, FaultConfig::default());
+        state.trace_reader =
+            Some(TraceReader::new(BufReader::new(File::open(&path).unwrap())).unwrap());
+        let mut notif = notification(libc::SYS_read, [4, 5, 6, 0, 0, 0]);
+        state.trace_notifications.insert(notif.id, notif);
+        let mut response = seccomp_notif_resp {
+            id: notif.id,
+            ..Default::default()
+        };
+        state.trace_response(&mut response).unwrap();
+        assert_eq!(response.val, 17);
+        notif.data.args[0] = 99;
+        state.trace_notifications.insert(notif.id, notif);
+        let error = state.trace_response(&mut response).unwrap_err().to_string();
+        assert!(error.contains("Replay divergence at virtual time 0ns"));
+        assert!(error.contains("with args"));
+        std::fs::remove_file(path).unwrap();
     }
 
     fn notification(nr: i64, args: [u64; 6]) -> seccomp_notif {

@@ -103,6 +103,21 @@ Exit code:           0
 
 Standard streams (`stdin`, `stdout`, `stderr`) are protected from injection so console output remains undisturbed. Repeating the command with `--seed 42` reproduces the identical sequence of injected errors.
 
+### Compact Trace Recording & Deterministic Replay
+
+Record execution into a portable, zero-overhead binary trace and replay it to verify exact execution parity:
+
+```bash
+# Record execution to trace file
+statis record --trace exec.trace --seed 42 -- ./target/debug/test_record_replay
+
+# Replay against recorded trace (detects any divergence down to timestamp and syscall)
+statis replay --trace exec.trace -- ./target/debug/test_record_replay
+
+# Inspect human-readable chronological event stream
+statis trace-dump exec.trace
+```
+
 ## Project Structure
 
 ```
@@ -114,6 +129,7 @@ src/
 ├── launcher/         Process isolation, auxv vDSO scrubbing, and socketpair fd passing
 ├── scheduler/        PMU instruction counting (perf_event_open) and thread pool
 ├── telemetry.rs      Execution metrics and performance profiling
+├── trace/            Compact binary trace serialization, reader/writer, and event dumper
 └── vm.rs             Remote process memory access (process_vm_readv / writev)
 tests/
 ├── test_target.rs          Multi-threaded getrandom and clock_gettime verification
@@ -121,7 +137,8 @@ tests/
 ├── test_concurrency.rs     4-thread mutex contention benchmark
 ├── test_rdtsc.rs           Direct x86-64 rdtsc/rdtscp assembly trap verification
 ├── test_epoll.rs           Epoll wait time warping verification
-└── test_fault_injection.rs Seed-reproducible socket/pipe fault injection
+├── test_fault_injection.rs Seed-reproducible socket/pipe fault injection
+└── test_record_replay.rs   Deterministic trace record and replay verification
 ```
 
 ## Running Tests
