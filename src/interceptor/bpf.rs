@@ -4,7 +4,7 @@ use super::notif::seccomp_data;
 
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 // These are x86_64 syscall numbers, independent of the build host's ABI.
-const INTERCEPTED_SYSCALLS: [u32; 7] = [228, 230, 35, 96, 318, 202, 24];
+const INTERCEPTED_SYSCALLS: [u32; 11] = [228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271];
 
 fn instruction(code: u32, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
     libc::sock_filter {
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(usize::from(program.len), filters.len());
         assert_eq!(program.filter.cast_const(), filters.as_ptr());
         for nr in (-1..1024).chain([i32::MIN, i32::MAX, 0x4000_0000 | 228]) {
-            let expected = if [228, 230, 35, 96, 318, 202, 24].contains(&nr) {
+            let expected = if [228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271].contains(&nr) {
                 libc::SECCOMP_RET_USER_NOTIF
             } else {
                 libc::SECCOMP_RET_ALLOW
@@ -129,7 +129,7 @@ mod tests {
     fn filter_kills_foreign_architectures() {
         let (filters, _) = create_filter_prog();
         for arch in [0, 0x4000_0003, 0xc000_00b7, u32::MAX] {
-            for nr in [0, 24, 35, 96, 202, 228, 230, 318] {
+            for nr in [0, 7, 24, 35, 96, 202, 228, 230, 232, 271, 281, 318] {
                 assert_eq!(evaluate(&filters, nr, arch), libc::SECCOMP_RET_KILL_PROCESS);
             }
         }

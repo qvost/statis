@@ -40,3 +40,8 @@ path = "tests/test_concurrency.rs"
 name = "test_rdtsc"
 test = false
 path = "tests/test_rdtsc.rs"
+
+[[bin]]
+name = "test_epoll"
+test = false
+path = "tests/test_epoll.rs"

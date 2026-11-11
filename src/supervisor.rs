@@ -208,12 +208,12 @@ impl State {
 
     fn cancel_invalid_notifications(&mut self, mut valid: impl FnMut(u64) -> bool) {
         for state in self.threads.values_mut() {
-            if let Some(id) = state.notification() {
-                if !valid(id) {
-                    self.futex_mgr.remove_by_notif_id(id);
-                    self.wheel.retain(|event| event.notif_id != id);
-                    *state = ThreadState::Runnable;
-                }
+            if let Some(id) = state.notification()
+                && !valid(id)
+            {
+                self.futex_mgr.remove_by_notif_id(id);
+                self.wheel.retain(|event| event.notif_id != id);
+                *state = ThreadState::Runnable;
             }
         }
     }
@@ -282,6 +282,10 @@ impl State {
             libc::SYS_clock_nanosleep => "clock_nanosleep",
             libc::SYS_nanosleep => "nanosleep",
             libc::SYS_gettimeofday => "gettimeofday",
+            libc::SYS_epoll_wait => "epoll_wait",
+            libc::SYS_epoll_pwait => "epoll_pwait",
+            libc::SYS_poll => "poll",
+            libc::SYS_ppoll => "ppoll",
             _ => "other",
         };
         self.telemetry.record_syscall(name);
@@ -293,6 +297,34 @@ impl State {
             ..Default::default()
         };
         match i64::from(notif.data.nr) {
+            libc::SYS_epoll_wait | libc::SYS_epoll_pwait | libc::SYS_poll => {
+                let timeout_arg = if i64::from(notif.data.nr) == libc::SYS_poll {
+                    2
+                } else {
+                    3
+                };
+                let timeout_ms = args[timeout_arg] as i32;
+                if timeout_ms <= 0 {
+                    response.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                } else {
+                    self.defer_timeout(notif, timeout_ms as u64 * 1_000_000)?;
+                    return Ok(None);
+                }
+            }
+            libc::SYS_ppoll => {
+                if args[2] == 0 {
+                    response.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                } else {
+                    let bytes = read.read_bytes(
+                        pid,
+                        args[2] as usize,
+                        std::mem::size_of::<libc::timespec>(),
+                    )?;
+                    let timeout_ns = sleep_duration_ns(&decode_timespec(&bytes)?)?;
+                    self.defer_timeout(notif, timeout_ns)?;
+                    return Ok(None);
+                }
+            }
             libc::SYS_sched_yield => {
                 self.threads.insert(pid, ThreadState::Yielded);
                 self.select_next_thread();
@@ -324,19 +356,7 @@ impl State {
                     read.read_bytes(pid, address as usize, std::mem::size_of::<libc::timespec>())?;
                 let req = decode_timespec(&bytes)?;
                 let sleep_ns = sleep_duration_ns(&req)?;
-                let wake_time_ns = self
-                    .clock
-                    .now_ns()
-                    .checked_add(sleep_ns)
-                    .ok_or(Errno::EINVAL)?;
-                self.wheel.add_timer(TimerEvent {
-                    wake_time_ns,
-                    notif_id: notif.id,
-                    tid: pid,
-                });
-                self.threads.insert(pid, ThreadState::Sleeping(notif.id));
-                // The event loop drains queued syscalls and refreshes live task
-                // states before deciding whether it can advance virtual time.
+                self.defer_timeout(notif, sleep_ns)?;
                 return Ok(None);
             }
             libc::SYS_gettimeofday => {
@@ -349,6 +369,24 @@ impl State {
             _ => response.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE,
         }
         Ok(Some(response))
+    }
+
+    fn defer_timeout(&mut self, notif: &seccomp_notif, timeout_ns: u64) -> nix::Result<()> {
+        let wake_time_ns = self
+            .clock
+            .now_ns()
+            .checked_add(timeout_ns)
+            .ok_or(Errno::EINVAL)?;
+        let tid = Pid::from_raw(notif.pid as i32);
+        self.wheel.add_timer(TimerEvent {
+            wake_time_ns,
+            notif_id: notif.id,
+            tid,
+        });
+        self.threads.insert(tid, ThreadState::Sleeping(notif.id));
+        // The event loop drains queued syscalls and refreshes live task states
+        // before warping to the earliest deadline when no threads are runnable.
+        Ok(())
     }
 
     fn emulate_futex(
@@ -378,7 +416,7 @@ impl State {
         if matches!(
             op,
             libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET | libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET
-        ) && uaddr % std::mem::align_of::<u32>() != 0
+        ) && !uaddr.is_multiple_of(std::mem::align_of::<u32>())
         {
             return Err(Errno::EINVAL);
         }
@@ -492,10 +530,7 @@ fn thread_snapshot(child: Pid) -> io::Result<BTreeMap<Pid, bool>> {
             }
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                ()
-            } // thread exited
+                    || error.raw_os_error() == Some(libc::ESRCH) => {} // thread exited
             Err(error) => return Err(error),
         }
     }
@@ -581,7 +616,7 @@ fn drain_wait_events(child: Pid, state: &mut State) -> Result<Option<i32>> {
                         signal,
                         initial_stop,
                         tsc::handle_tsc_fault,
-                        |pid, signal| ptrace::cont(pid, signal),
+                        ptrace::cont,
                     )?;
                 }
                 WaitStatus::PtraceEvent(pid, _, event) => {
@@ -817,6 +852,249 @@ pub fn run_supervisor_with_telemetry(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn millisecond_wait(nr: i64, timeout_ms: i32) -> seccomp_notif {
+        let mut args = [0; 6];
+        // Give the other possible timeout argument a conflicting value.
+        args[2] = u64::MAX;
+        args[3] = u64::MAX;
+        args[if nr == libc::SYS_poll { 2 } else { 3 }] = timeout_ms as u32 as u64;
+        notification(nr, args)
+    }
+
+    #[test]
+    fn finite_event_waits_use_millisecond_deadlines_and_timeout_successfully() {
+        for (nr, name) in [
+            (libc::SYS_poll, "poll"),
+            (libc::SYS_epoll_wait, "epoll_wait"),
+            (libc::SYS_epoll_pwait, "epoll_pwait"),
+        ] {
+            for timeout_ms in [1, 37, i32::MAX] {
+                let mut state = State::new(0, 10_000);
+                state.clock.advance_to(123);
+                let notif = millisecond_wait(nr, timeout_ms);
+                let tid = Pid::from_raw(notif.pid as i32);
+                state.begin_notification(&notif);
+                assert!(
+                    state
+                        .emulate_with_reader(&notif, |_, _, _| panic!("unexpected read"))
+                        .unwrap()
+                        .is_none()
+                );
+                let deadline = 123 + timeout_ms as u64 * 1_000_000;
+                assert_eq!(state.clock.now_ns(), 123);
+                assert_eq!(state.wheel.earliest_wake_time(), Some(deadline));
+                assert_eq!(state.threads[&tid], ThreadState::Sleeping(notif.id));
+                assert!(state.warp_if_idle());
+                assert_eq!(state.clock.now_ns(), deadline);
+                assert_eq!(state.take_expired().len(), 1);
+                let response = state.pending_responses.pop_front().unwrap();
+                assert_eq!(
+                    (response.id, response.val, response.error, response.flags),
+                    (notif.id, 0, 0, 0)
+                );
+                assert_eq!(state.threads[&tid], ThreadState::Runnable);
+                assert!(state.take_expired().is_empty());
+                assert!(state.pending_responses.is_empty());
+                assert_eq!(state.telemetry.syscall_counts[name], 1);
+                assert!(!state.telemetry.syscall_counts.contains_key("other"));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_infinite_event_waits_continue_in_kernel() {
+        for (nr, name) in [
+            (libc::SYS_poll, "poll"),
+            (libc::SYS_epoll_wait, "epoll_wait"),
+            (libc::SYS_epoll_pwait, "epoll_pwait"),
+        ] {
+            let mut state = State::new(0, 10_000);
+            for timeout in [0, -1, i32::MIN] {
+                let notif = millisecond_wait(nr, timeout);
+                let response = state
+                    .emulate_with_reader(&notif, |_, _, _| panic!("unexpected read"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.flags, SECCOMP_USER_NOTIF_FLAG_CONTINUE);
+                assert_eq!((response.val, response.error), (0, 0));
+                assert!(state.wheel.is_empty());
+                assert_eq!(state.clock.now_ns(), 0);
+            }
+            assert_eq!(state.telemetry.syscall_counts[name], 3);
+        }
+    }
+
+    #[test]
+    fn event_wait_timeout_is_a_signed_32_bit_argument() {
+        let mut state = State::new(0, 10_000);
+        let mut notif = millisecond_wait(libc::SYS_poll, 0);
+        notif.data.args[2] = 0xffff_ffff_0000_0002;
+        assert!(state.emulate(&notif).unwrap().is_none());
+        assert_eq!(state.wheel.earliest_wake_time(), Some(2_000_000));
+    }
+
+    #[test]
+    fn ppoll_reads_timespec_or_continues_for_a_null_timeout() {
+        let mut state = State::new(0, 10_000);
+        let null = notification(libc::SYS_ppoll, [0; 6]);
+        let response = state
+            .emulate_with_reader(&null, |_, _, _| panic!("NULL timeout"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.flags, SECCOMP_USER_NOTIF_FLAG_CONTINUE);
+        assert!(state.wheel.is_empty());
+        state.clock.advance_to(42);
+        let notif = notification(libc::SYS_ppoll, [0, 0, 0x2000, 0x3000, 8, 0]);
+        state.begin_notification(&notif);
+        assert!(
+            state
+                .emulate_with_reader(&notif, |pid, address, len| {
+                    assert_eq!((pid.as_raw() as u32, address, len), (notif.pid, 0x2000, 16));
+                    Ok(request_bytes(2, 345))
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.wheel.earliest_wake_time(), Some(2_000_000_387));
+        assert!(state.warp_if_idle());
+        state.take_expired();
+        let response = state.pending_responses.pop_front().unwrap();
+        assert_eq!((response.val, response.error, response.flags), (0, 0, 0));
+        assert_eq!(state.telemetry.syscall_counts["ppoll"], 2);
+    }
+
+    #[test]
+    fn zero_ppoll_timeout_expires_without_advancing_time() {
+        let mut state = State::new(0, 10_000);
+        state.clock.advance_to(42);
+        let notif = notification(libc::SYS_ppoll, [0, 0, 0x2000, 0, 0, 0]);
+        state.begin_notification(&notif);
+        assert!(
+            state
+                .emulate_with_reader(&notif, |_, _, _| Ok(request_bytes(0, 0)))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.take_expired().len(), 1);
+        let response = state.pending_responses.pop_front().unwrap();
+        assert_eq!(
+            (response.id, response.val, response.error),
+            (notif.id, 0, 0)
+        );
+        assert_eq!(state.clock.now_ns(), 42);
+    }
+
+    #[test]
+    fn event_waits_validate_timespec_and_deadline_overflow_before_enqueuing() {
+        let mut state = State::new(0, 10_000);
+        let ppoll = notification(libc::SYS_ppoll, [0, 0, 0x2000, 0, 0, 0]);
+        state.begin_notification(&ppoll);
+        for (seconds, nanos) in [(-1, 0), (0, -1), (0, 1_000_000_000), (i64::MAX, 0)] {
+            assert_eq!(
+                state
+                    .emulate_with_reader(&ppoll, |_, _, _| Ok(request_bytes(seconds, nanos)))
+                    .unwrap_err(),
+                Errno::EINVAL
+            );
+        }
+        assert_eq!(
+            state
+                .emulate_with_reader(&ppoll, |_, _, _| Err(Errno::EFAULT))
+                .unwrap_err(),
+            Errno::EFAULT
+        );
+        assert_eq!(
+            state
+                .emulate_with_reader(&ppoll, |_, _, _| Ok(vec![0; 8]))
+                .unwrap_err(),
+            Errno::EFAULT
+        );
+        state.clock.advance_to(u64::MAX);
+        assert_eq!(
+            state
+                .emulate_with_reader(&ppoll, |_, _, _| Ok(request_bytes(0, 1)))
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        for nr in [libc::SYS_poll, libc::SYS_epoll_wait, libc::SYS_epoll_pwait] {
+            assert_eq!(
+                state.emulate(&millisecond_wait(nr, 1)).unwrap_err(),
+                Errno::EINVAL
+            );
+        }
+        assert!(state.wheel.is_empty());
+        assert!(state.pending_responses.is_empty());
+        assert_eq!(state.threads[&Pid::this()], ThreadState::Runnable);
+    }
+
+    #[test]
+    fn event_waits_defer_warp_until_idle_and_wake_by_deadline() {
+        let mut state = State::new(0, 10_000);
+        state.refresh_threads(BTreeMap::from([
+            (Pid::from_raw(1), true),
+            (Pid::from_raw(2), true),
+        ]));
+        let mut poll = millisecond_wait(libc::SYS_poll, 20);
+        poll.pid = 1;
+        poll.id = 1;
+        state.begin_notification(&poll);
+        state.emulate(&poll).unwrap();
+        assert!(!state.warp_if_idle());
+        assert_eq!(state.clock.now_ns(), 0);
+        let mut epoll = millisecond_wait(libc::SYS_epoll_wait, 10);
+        epoll.pid = 2;
+        epoll.id = 2;
+        state.begin_notification(&epoll);
+        state.emulate(&epoll).unwrap();
+        assert!(state.warp_if_idle());
+        assert_eq!(state.clock.now_ns(), 10_000_000);
+        assert_eq!(state.take_expired()[0].notif_id, 2);
+        assert!(!state.warp_if_idle()); // the newly awakened thread can run
+        state.refresh_threads(BTreeMap::from([
+            (Pid::from_raw(1), false),
+            (Pid::from_raw(2), false),
+        ]));
+        assert!(state.warp_if_idle());
+        assert_eq!(state.clock.now_ns(), 20_000_000);
+        assert_eq!(state.take_expired()[0].notif_id, 1);
+        assert_eq!(
+            state
+                .pending_responses
+                .iter()
+                .map(|resp| resp.id)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+    }
+
+    #[test]
+    fn canceled_event_waits_do_not_receive_timeout_responses() {
+        for nr in [
+            libc::SYS_poll,
+            libc::SYS_epoll_wait,
+            libc::SYS_epoll_pwait,
+            libc::SYS_ppoll,
+        ] {
+            let mut state = State::new(0, 10_000);
+            let notif = if nr == libc::SYS_ppoll {
+                notification(nr, [0, 0, 0x2000, 0, 0, 0])
+            } else {
+                millisecond_wait(nr, 1000)
+            };
+            state.begin_notification(&notif);
+            assert!(
+                state
+                    .emulate_with_reader(&notif, |_, _, _| Ok(request_bytes(1, 0)))
+                    .unwrap()
+                    .is_none()
+            );
+            state.cancel_invalid_notifications(|_| false);
+            state.clock.advance_to(2_000_000_000);
+            assert!(state.take_expired().is_empty());
+            assert!(state.pending_responses.is_empty());
+        }
+    }
 
     #[test]
     fn timestamp_faults_advance_fifty_ns_and_resume_without_sigsegv() {
@@ -1985,6 +2263,58 @@ mod tests {
                     {
                         libc::_exit(10);
                     }
+                    if libc::syscall(
+                        libc::SYS_poll,
+                        std::ptr::null_mut::<libc::pollfd>(),
+                        0_usize,
+                        0_i32,
+                    ) != 0
+                    {
+                        libc::_exit(11);
+                    }
+                    if libc::syscall(
+                        libc::SYS_poll,
+                        std::ptr::null_mut::<libc::pollfd>(),
+                        0_usize,
+                        2_i32,
+                    ) != 0
+                    {
+                        libc::_exit(12);
+                    }
+                    let epoll_fd =
+                        libc::syscall(libc::SYS_epoll_create1, libc::EPOLL_CLOEXEC) as RawFd;
+                    if epoll_fd < 0 {
+                        libc::_exit(13);
+                    }
+                    let mut event = libc::epoll_event { events: 0, u64: 0 };
+                    if libc::syscall(libc::SYS_epoll_wait, epoll_fd, &mut event, 1_i32, 3_i32) != 0
+                    {
+                        libc::_exit(14);
+                    }
+                    if libc::syscall(
+                        libc::SYS_epoll_pwait,
+                        epoll_fd,
+                        &mut event,
+                        1_i32,
+                        4_i32,
+                        std::ptr::null::<libc::sigset_t>(),
+                        8_usize,
+                    ) != 0
+                    {
+                        libc::_exit(15);
+                    }
+                    libc::close(epoll_fd);
+                    if libc::syscall(
+                        libc::SYS_ppoll,
+                        std::ptr::null_mut::<libc::pollfd>(),
+                        0_usize,
+                        &requests[1],
+                        std::ptr::null::<libc::sigset_t>(),
+                        8_usize,
+                    ) != 0
+                    {
+                        libc::_exit(16);
+                    }
                     libc::_exit(0);
                 }
             }
@@ -2026,8 +2356,12 @@ mod tests {
             let _ = waitpid(child, None);
         }
         assert_eq!(result.unwrap(), 0);
-        assert_eq!(reads, 6);
-        assert_eq!(state.clock.now_ns(), 80_000_000_200);
+        assert_eq!(reads, 7);
+        assert_eq!(state.clock.now_ns(), 100_009_000_200);
+        assert_eq!(state.telemetry.syscall_counts["poll"], 2);
+        for name in ["epoll_wait", "epoll_pwait", "ppoll"] {
+            assert_eq!(state.telemetry.syscall_counts[name], 1);
+        }
         assert!(state.wheel.is_empty());
         assert!(
             state
