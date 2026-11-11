@@ -55,3 +55,8 @@ path = "tests/test_epoll.rs"
 name = "test_record_replay"
 test = false
 path = "tests/test_record_replay.rs"
+
+[[bin]]
+name = "test_process_tree"
+test = false
+path = "tests/test_process_tree.rs"

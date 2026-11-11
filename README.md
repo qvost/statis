@@ -31,6 +31,7 @@ When a trapped syscall is executed, the kernel pauses the thread and notifies `s
 - **`SYS_nanosleep` / `SYS_clock_nanosleep`**: Enqueues a deadline in a min-heap time wheel. If all runnable threads in the target process tree are sleeping or blocked, `statis` warps the virtual clock directly to the next scheduled deadline without waiting in wall-clock time.
 - **`SYS_futex` / `SYS_sched_yield`**: Coordinates thread descheduling and wait queues to maintain deterministic lock acquisition order, including kernel `CLONE_CHILD_CLEARTID` exits.
 - **Hardware RDTSC / RDTSCP**: Inline assembly reads of the timestamp counter fault into `SIGSEGV` via `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)`, where `statis` catches the fault, virtualizes `RAX:RDX` from the virtual clock, sets synthetic core ID in `RCX`, advances `RIP`, and resumes seamlessly.
+- **Process Hierarchy & Synthetic PID Virtualization**: Virtualizes `SYS_getpid` (root PID `1000`, PPID `999`), `SYS_getppid`, and `SYS_gettid`, allocating deterministic monotonic IDs for forked processes (`1001`, `1002`, ...) while translating `SYS_kill` / `SYS_tgkill` to underlying OS processes. Neutralizes vDSO across `execve` boundaries via ptrace.
 
 ## Building
 
@@ -138,6 +139,7 @@ tests/
 ├── test_rdtsc.rs           Direct x86-64 rdtsc/rdtscp assembly trap verification
 ├── test_epoll.rs           Epoll wait time warping verification
 ├── test_fault_injection.rs Seed-reproducible socket/pipe fault injection
+├── test_process_tree.rs    Multi-process hierarchy and synthetic PID verification
 └── test_record_replay.rs   Deterministic trace record and replay verification
 ```
 

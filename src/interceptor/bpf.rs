@@ -4,7 +4,9 @@ use super::notif::seccomp_data;
 
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 // These are x86_64 syscall numbers, independent of the build host's ABI.
-const INTERCEPTED_SYSCALLS: [u32; 11] = [228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271];
+const INTERCEPTED_SYSCALLS: [u32; 16] = [
+    228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271, 39, 110, 186, 62, 234,
+];
 
 pub const IO_SYSCALLS: [u32; 9] = [0, 1, 42, 43, 44, 45, 46, 47, 288];
 
@@ -168,7 +170,11 @@ mod tests {
         assert_eq!(usize::from(program.len), filters.len());
         assert_eq!(program.filter.cast_const(), filters.as_ptr());
         for nr in (-1..1024).chain([i32::MIN, i32::MAX, 0x4000_0000 | 228]) {
-            let expected = if [228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271].contains(&nr) {
+            let expected = if [
+                228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271, 39, 110, 186, 62, 234,
+            ]
+            .contains(&nr)
+            {
                 libc::SECCOMP_RET_USER_NOTIF
             } else {
                 libc::SECCOMP_RET_ALLOW
@@ -188,7 +194,10 @@ mod tests {
             assert_eq!(usize::from(program.len), filters.len());
             assert_eq!(program.filter.cast_const(), filters.as_ptr());
             for nr in (-1..1024).chain([i32::MIN, i32::MAX, 0x4000_0000, 0x4000_0000 | 228]) {
-                let simulated = [228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271].contains(&nr);
+                let simulated = [
+                    228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271, 39, 110, 186, 62, 234,
+                ]
+                .contains(&nr);
                 let io = [0, 1, 42, 43, 44, 45, 46, 47, 288].contains(&nr);
                 let expected = if simulated || (intercept_io && io) {
                     libc::SECCOMP_RET_USER_NOTIF
@@ -236,13 +245,31 @@ mod tests {
     }
 
     #[test]
+    fn process_and_thread_ids_notify_with_and_without_io_interception() {
+        let ip = 0x1234_5678_9abc_def0;
+        for (filters, _) in [
+            create_filter_prog(),
+            create_filter_prog_ext(true),
+            create_filter_prog_with_io(true, ip),
+        ] {
+            for nr in [39, 110, 186] {
+                assert_eq!(
+                    evaluate_at(&filters, nr, AUDIT_ARCH_X86_64, ip + 1),
+                    libc::SECCOMP_RET_USER_NOTIF,
+                    "syscall {nr}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn filter_kills_foreign_architectures() {
         for intercept_io in [false, true] {
             let (filters, _) = create_filter_prog_ext(intercept_io);
             for arch in [0, 0x4000_0003, 0xc000_00b7, u32::MAX] {
                 for nr in [
-                    0, 1, 7, 24, 35, 42, 43, 44, 45, 46, 47, 96, 202, 228, 230, 232, 271, 281, 288,
-                    318,
+                    0, 1, 7, 24, 35, 39, 42, 43, 44, 45, 46, 47, 62, 96, 110, 186, 202, 228, 230,
+                    232, 234, 271, 281, 288, 318,
                 ] {
                     assert_eq!(evaluate(&filters, nr, arch), libc::SECCOMP_RET_KILL_PROCESS);
                 }
