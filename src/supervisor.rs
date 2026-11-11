@@ -24,11 +24,13 @@ use crate::{
         FutexManager, FutexWaiter, SECCOMP_USER_NOTIF_FLAG_CONTINUE, is_id_valid,
         recv_notification, seccomp_notif, seccomp_notif_resp, send_response,
     },
+    scheduler::{DeterministicScheduler, ThreadState as SchedulerThreadState, pmu},
     vm,
 };
 
 struct State {
     rng: ChaCha20Rng,
+    scheduler: DeterministicScheduler,
     clock: VirtualClock,
     wheel: TimeWheel,
     threads: BTreeMap<Pid, ThreadState>,
@@ -85,9 +87,10 @@ impl ThreadState {
 }
 
 impl State {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, quantum: u64) -> Self {
         Self {
             rng: ChaCha20Rng::seed_from_u64(seed),
+            scheduler: DeterministicScheduler::new(seed, quantum),
             clock: VirtualClock::default(),
             wheel: TimeWheel::default(),
             threads: BTreeMap::new(),
@@ -96,8 +99,33 @@ impl State {
         }
     }
 
+    fn register_thread(&mut self, tid: Pid) {
+        if self.scheduler.thread_mut(tid).is_some() {
+            return;
+        }
+        self.scheduler.register_thread(tid);
+        match pmu::attach_pmu_to_thread(tid, self.scheduler.quantum()) {
+            Ok(fd) => self.scheduler.thread_mut(tid).unwrap().pmu_fd = Some(fd),
+            Err(error) => log::debug!("PMU unavailable for thread {tid}: {error}"),
+        }
+    }
+
+    fn select_next_thread(&mut self) -> Option<Pid> {
+        for (&tid, state) in &self.threads {
+            if let Some(thread) = self.scheduler.thread_mut(tid) {
+                thread.state = if matches!(state, ThreadState::Runnable | ThreadState::Yielded) {
+                    SchedulerThreadState::Runnable
+                } else {
+                    SchedulerThreadState::Waiting
+                };
+            }
+        }
+        self.scheduler.pick_next_runnable()
+    }
+
     fn begin_notification(&mut self, notif: &seccomp_notif) {
         let tid = Pid::from_raw(notif.pid as i32);
+        self.register_thread(tid);
         if let Some(id) = self
             .threads
             .get(&tid)
@@ -129,8 +157,12 @@ impl State {
                 }
             }
         }
+        for tid in self.threads.keys().filter(|tid| !tasks.contains_key(tid)) {
+            self.scheduler.remove_thread(*tid);
+        }
         self.threads.retain(|tid, _| tasks.contains_key(tid));
         for (tid, runnable) in tasks {
+            self.register_thread(tid);
             let state = self.threads.entry(tid).or_insert(ThreadState::Waiting);
             if state.notification().is_none() {
                 *state = if runnable {
@@ -244,6 +276,7 @@ impl State {
         match i64::from(notif.data.nr) {
             libc::SYS_sched_yield => {
                 self.threads.insert(pid, ThreadState::Yielded);
+                self.select_next_thread();
                 self.clock.advance_tick();
             }
             libc::SYS_futex => return self.emulate_futex(notif, read),
@@ -436,7 +469,12 @@ fn thread_snapshot(child: Pid) -> io::Result<BTreeMap<Pid, bool>> {
             Ok(stat) => {
                 tasks.insert(Pid::from_raw(tid), task_is_runnable(&stat)?);
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (), // thread exited
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                ()
+            } // thread exited
             Err(error) => return Err(error),
         }
     }
@@ -503,8 +541,8 @@ fn flush_responses(state: &mut State, fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-fn supervise(child: Pid, notif_fd: &OwnedFd, seed: u64) -> Result<i32> {
-    let mut state = State::new(seed);
+fn supervise(child: Pid, notif_fd: &OwnedFd, seed: u64, quantum: u64) -> Result<i32> {
+    let mut state = State::new(seed, quantum);
     supervise_loop(child, notif_fd, &mut state, State::emulate)
 }
 
@@ -543,8 +581,8 @@ fn supervise_loop(
             }
         }
         if revents == 0 {
-            // Polling bounds exit detection; pending timers also need frequent
-            // task-state refreshes for threads entering an untrapped futex wait.
+            // Bound exit detection and refresh task states promptly for virtual
+            // timer warps and implicit kernel futex wakes on thread exit.
             revents = poll_listener(
                 fd,
                 if state.wheel.is_empty() && state.futex_mgr.is_empty() {
@@ -603,8 +641,8 @@ fn supervise_loop(
 
 /// Supervise intercepted syscalls and reap the child, returning its exit code.
 /// Signal deaths use the shell convention of 128 plus the signal number.
-pub fn run_supervisor(child: Pid, notif_fd: OwnedFd, seed: u64) -> Result<i32> {
-    let result = supervise(child, &notif_fd, seed);
+pub fn run_supervisor(child: Pid, notif_fd: OwnedFd, seed: u64, quantum: u64) -> Result<i32> {
+    let result = supervise(child, &notif_fd, seed, quantum);
     if result.is_err() {
         // A failed supervisor must not leave its target blocked in a syscall.
         let _ = kill(child, Signal::SIGKILL);
@@ -662,7 +700,7 @@ mod tests {
     #[test]
     fn exiting_worker_wakes_join_and_cancels_any_timeout() {
         for timeout in [0, 0x2000] {
-            let mut state = State::new(0);
+            let mut state = State::new(0, 10_000);
             let join = futex_notification(
                 1,
                 101,
@@ -710,7 +748,7 @@ mod tests {
 
     #[test]
     fn cleared_tid_wakes_even_if_worker_exited_before_discovery() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let join = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 7, 0, 0, 0]);
         emulate_futex_request(&mut state, &join, 7, (0, 0)).unwrap();
         state.refresh_threads_with_memory(
@@ -726,7 +764,7 @@ mod tests {
 
     #[test]
     fn live_or_unreadable_futex_words_remain_waiting() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let join = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 7, 0, 0, 0]);
         emulate_futex_request(&mut state, &join, 7, (0, 0)).unwrap();
         let tasks = BTreeMap::from([(Pid::from_raw(1), false)]);
@@ -744,7 +782,7 @@ mod tests {
 
     #[test]
     fn unrelated_exit_does_not_wake_an_unchanged_zero_wait() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let wait = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 0, 0, 0, 0]);
         emulate_futex_request(&mut state, &wait, 0, (0, 0)).unwrap();
         state
@@ -764,7 +802,7 @@ mod tests {
 
     #[test]
     fn dead_waiter_is_removed_without_sending_a_response() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let wait = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 7, 0x2000, 0, 0]);
         emulate_futex_request(&mut state, &wait, 7, (10, 0)).unwrap();
         state.refresh_threads_with_memory(BTreeMap::new(), &mut |_,
@@ -779,8 +817,134 @@ mod tests {
     }
 
     #[test]
+    fn real_clear_child_tid_exit_releases_an_untimed_join() {
+        use nix::{
+            sys::socket::{AddressFamily, SockFlag, SockType, socketpair},
+            unistd::{ForkResult, fork},
+        };
+
+        extern "C" fn worker(_: *mut libc::c_void) -> libc::c_int {
+            // SAFETY: no pointers or inherited Rust runtime state are accessed.
+            // SYS_exit terminates just this thread, triggering clear_child_tid.
+            unsafe {
+                libc::syscall(libc::SYS_sched_yield);
+                libc::syscall(libc::SYS_exit, 0);
+            }
+            0
+        }
+
+        let mut stack = [0_u128; 4096]; // 64 KiB, aligned for the x86_64 ABI
+        let mut child_tid = 0_i32;
+        let tid_address = std::ptr::from_mut(&mut child_tid) as usize;
+        let (_filters, program) = crate::interceptor::create_filter_prog();
+        let (parent_socket, child_socket) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        // SAFETY: the child only uses stack data, syscalls, and fd passing;
+        // neither it nor its clone returns to the test harness.
+        let child = match unsafe { fork() }.unwrap() {
+            ForkResult::Child => unsafe {
+                libc::close(parent_socket.as_raw_fd());
+                libc::alarm(5); // regressions must fail instead of hanging the suite
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    libc::_exit(1);
+                }
+                let fd = libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                    &program,
+                ) as RawFd;
+                if fd < 0 || crate::launcher::send_fd(child_socket.as_raw_fd(), fd).is_err() {
+                    libc::_exit(2);
+                }
+                libc::close(fd);
+                libc::close(child_socket.as_raw_fd());
+                let flags = libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_FILES
+                    | libc::CLONE_SIGHAND
+                    | libc::CLONE_THREAD
+                    | libc::CLONE_SYSVSEM
+                    | libc::CLONE_PARENT_SETTID
+                    | libc::CLONE_CHILD_CLEARTID;
+                let tid = libc::clone(
+                    worker,
+                    stack.as_mut_ptr().add(stack.len()).cast(),
+                    flags,
+                    std::ptr::null_mut(),
+                    tid_address as *mut libc::pid_t,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    tid_address as *mut libc::pid_t,
+                );
+                if tid < 0 {
+                    libc::_exit(3);
+                }
+                if libc::syscall(
+                    libc::SYS_futex,
+                    &child_tid,
+                    libc::FUTEX_WAIT_BITSET | libc::FUTEX_CLOCK_REALTIME,
+                    tid,
+                    0_usize,
+                    0_usize,
+                    u32::MAX,
+                ) != 0
+                {
+                    libc::_exit(4);
+                }
+                // The worker must have actually exited and had its TID cleared.
+                if std::ptr::read_volatile(&child_tid) != 0 {
+                    libc::_exit(5);
+                }
+                libc::_exit(0);
+            },
+            ForkResult::Parent { child } => child,
+        };
+        drop(child_socket);
+        let listener = crate::launcher::recv_fd(parent_socket.as_raw_fd());
+        if listener.is_err() {
+            let _ = waitpid(child, None);
+        }
+        let listener = listener.expect("child must transfer its seccomp listener");
+        let mut state = State::new(0, 10_000);
+        let mut joins = 0;
+        let result = supervise_loop(child, &listener, &mut state, |state, notif| {
+            if i64::from(notif.data.nr) == libc::SYS_futex {
+                joins += 1;
+                // Supply the known comparison value for the initial enqueue;
+                // the real exiting worker and task snapshots drive the wake.
+                // This keeps the regression executable when process_vm is denied.
+                state.emulate_with_reader(notif, |pid, address, len| {
+                    if pid == child && address == tid_address && len == 4 {
+                        Ok((notif.data.args[2] as u32).to_ne_bytes().to_vec())
+                    } else {
+                        Err(Errno::EFAULT)
+                    }
+                })
+            } else {
+                state.emulate(notif)
+            }
+        });
+        if result.is_err() {
+            let _ = kill(child, Signal::SIGKILL);
+            let _ = waitpid(child, None);
+        }
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(joins, 1);
+        assert_eq!(state.clock.now_ns(), 100); // only the worker's sched_yield
+        assert!(state.futex_mgr.is_empty());
+        assert!(state.wheel.is_empty());
+        assert!(state.pending_responses.is_empty());
+        assert_eq!(waitpid(child, None), Err(Errno::ECHILD));
+    }
+
+    #[test]
     fn futex_wait_compares_word_before_enqueuing() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let notif = futex_notification(
             1,
             1,
@@ -816,7 +980,7 @@ mod tests {
 
     #[test]
     fn futex_wake_uses_fifo_masks_and_returns_actual_count() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         for (id, mask) in [(1, 1), (2, 2), (3, 3)] {
             let notif = futex_notification(
                 id,
@@ -896,7 +1060,7 @@ mod tests {
             (libc::FUTEX_WAIT_BITSET, 500),
             (libc::FUTEX_WAIT_BITSET | libc::FUTEX_CLOCK_REALTIME, 500),
         ] {
-            let mut state = State::new(0);
+            let mut state = State::new(0, 10_000);
             state.clock.advance_to(100);
             let notif = futex_notification(1, 1, [0x1000, op as u64, 7, 0x2000, 0, 1]);
             assert!(
@@ -921,7 +1085,7 @@ mod tests {
 
     #[test]
     fn futex_wake_cancels_timeout_without_a_second_reply() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let wait = futex_notification(1, 1, [0x1000, libc::FUTEX_WAIT as u64, 7, 0x2000, 0, 0]);
         emulate_futex_request(&mut state, &wait, 7, (10, 0)).unwrap();
         let wake = futex_notification(2, 2, [0x1000, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]);
@@ -942,7 +1106,7 @@ mod tests {
 
     #[test]
     fn futex_cancellation_cleans_timed_and_untimed_waits() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         for (id, timeout) in [(1, 0), (2, 0x2000)] {
             let wait = futex_notification(
                 id,
@@ -971,7 +1135,7 @@ mod tests {
 
     #[test]
     fn futex_invalid_requests_leave_no_pending_wait() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         for op in [libc::FUTEX_WAIT_BITSET, libc::FUTEX_WAKE_BITSET] {
             let notif = futex_notification(1, 1, [0x1000, op as u64, 7, 0, 0, 0]);
             assert_eq!(
@@ -1009,7 +1173,7 @@ mod tests {
 
     #[test]
     fn futex_immediate_timeout_and_mismatch_precedence() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         state.clock.advance_to(100);
         for (op, timeout) in [
             (libc::FUTEX_WAIT, (0, 0)),
@@ -1035,7 +1199,7 @@ mod tests {
 
     #[test]
     fn yield_ticks_the_clock_and_expires_futex_waits() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let wait = futex_notification(1, 1, [0x1000, libc::FUTEX_WAIT as u64, 7, 0x2000, 0, 0]);
         emulate_futex_request(&mut state, &wait, 7, (0, 100)).unwrap();
         let mut yield_call = notification(libc::SYS_sched_yield, [0; 6]);
@@ -1054,7 +1218,7 @@ mod tests {
 
     #[test]
     fn unhandled_futex_operations_continue_in_kernel() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let notif = futex_notification(1, 1, [0x1000, libc::FUTEX_REQUEUE as u64, 0, 0, 0, 0]);
         let response = state
             .emulate_with_reader(&notif, |_, _, _| panic!("unexpected read"))
@@ -1108,7 +1272,7 @@ mod tests {
     #[test]
     fn sleep_syscalls_read_the_correct_request_argument() {
         for (nr, expected_address) in [(libc::SYS_nanosleep, 11), (libc::SYS_clock_nanosleep, 33)] {
-            let mut state = State::new(0);
+            let mut state = State::new(0, 10_000);
             let notif = notification(nr, [11, 22, 33, 44, 0, 0]);
             state.begin_notification(&notif);
             let response = state
@@ -1128,7 +1292,7 @@ mod tests {
     #[test]
     fn bad_requests_do_not_enqueue_or_advance_time() {
         let notif = notification(libc::SYS_nanosleep, [0; 6]);
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         state.begin_notification(&notif);
         assert_eq!(
             state
@@ -1163,7 +1327,7 @@ mod tests {
 
     #[test]
     fn lone_sleeper_warps_and_wakes_exactly_once() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         schedule(&mut state, 1, 42, 999_999_999);
         assert!(state.warp_if_idle());
         assert_eq!(state.clock.now_ns(), 999_999_999);
@@ -1186,7 +1350,7 @@ mod tests {
 
     #[test]
     fn runnable_threads_prevent_warp_and_shortest_sleep_wakes_first() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         state.refresh_threads(BTreeMap::from([
             (Pid::from_raw(1), true),
             (Pid::from_raw(2), true),
@@ -1212,7 +1376,7 @@ mod tests {
 
     #[test]
     fn clock_ticks_expire_pending_timers_without_a_warp() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         schedule(&mut state, 1, 1, 200);
         let mut clock_read = notification(libc::SYS_gettimeofday, [0; 6]);
         clock_read.pid = 2;
@@ -1226,7 +1390,7 @@ mod tests {
 
     #[test]
     fn equal_deadlines_wake_together() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         schedule(&mut state, 1, 2, 100);
         schedule(&mut state, 2, 1, 100);
         assert!(state.warp_if_idle());
@@ -1244,7 +1408,7 @@ mod tests {
 
     #[test]
     fn canceled_notifications_and_exited_threads_leave_no_timers() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         schedule(&mut state, 1, 1, 100);
         state.cancel_invalid_notifications(|_| false);
         assert!(state.wheel.is_empty());
@@ -1266,7 +1430,7 @@ mod tests {
 
     #[test]
     fn newly_discovered_workers_prevent_premature_warp() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         schedule(&mut state, 1, 1, 100);
         state.refresh_threads(BTreeMap::from([
             (Pid::from_raw(1), false),
@@ -1274,6 +1438,22 @@ mod tests {
         ]));
         assert_eq!(state.threads[&Pid::from_raw(1)], ThreadState::Sleeping(1));
         assert!(!state.warp_if_idle());
+    }
+
+    #[test]
+    fn yield_selects_only_runnable_registered_threads() {
+        let mut state = State::new(42, 10_000);
+        let mut yielded = notification(libc::SYS_sched_yield, [0; 6]);
+        yielded.pid = 1;
+        state.begin_notification(&yielded);
+        state.register_thread(Pid::from_raw(2));
+        state
+            .threads
+            .insert(Pid::from_raw(2), ThreadState::Sleeping(55));
+        state.emulate(&yielded).unwrap();
+        assert_eq!(state.scheduler.active_tid(), Some(Pid::from_raw(1)));
+        state.refresh_threads_with_memory(BTreeMap::new(), &mut |_, _, _| Err(Errno::EFAULT));
+        assert_eq!(state.scheduler.active_tid(), None);
     }
 
     #[test]
@@ -1297,13 +1477,13 @@ mod tests {
         }
         let mut a = [0_u8; 32];
         let mut b = [0_u8; 32];
-        let response = State::new(7)
+        let response = State::new(7, 10_000)
             .emulate(&notification(
                 libc::SYS_getrandom,
                 [a.as_mut_ptr() as u64, 32, 0, 0, 0, 0],
             ))
             .unwrap();
-        State::new(7)
+        State::new(7, 10_000)
             .emulate(&notification(
                 libc::SYS_getrandom,
                 [b.as_mut_ptr() as u64, 32, 0, 0, 0, 0],
@@ -1312,7 +1492,7 @@ mod tests {
         assert_eq!(response.unwrap().id, 42);
         assert_eq!(response.unwrap().val, 32);
         assert_eq!(a, b);
-        State::new(8)
+        State::new(8, 10_000)
             .emulate(&notification(
                 libc::SYS_getrandom,
                 [b.as_mut_ptr() as u64, 32, 0, 0, 0, 0],
@@ -1326,7 +1506,7 @@ mod tests {
         if !vm::memory_access_available() {
             return;
         }
-        let mut state = State::new(7);
+        let mut state = State::new(7, 10_000);
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -1377,7 +1557,7 @@ mod tests {
 
     #[test]
     fn invalid_memory_and_unhandled_syscalls() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         if vm::memory_access_available() {
             assert_eq!(
                 state
@@ -1394,7 +1574,7 @@ mod tests {
 
     #[test]
     fn null_timeval_advances_one_tick() {
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let response = state
             .emulate(&notification(libc::SYS_gettimeofday, [0; 6]))
             .unwrap()
@@ -1411,7 +1591,7 @@ mod tests {
         let (child, fd) =
             crate::launcher::launch_child(Path::new("/bin/sh"), &["-c".into(), "exit 23".into()])
                 .unwrap();
-        assert_eq!(run_supervisor(child, fd, 7).unwrap(), 23);
+        assert_eq!(run_supervisor(child, fd, 7, 10_000).unwrap(), 23);
         assert_eq!(waitpid(child, None), Err(Errno::ECHILD));
     }
 
@@ -1543,7 +1723,7 @@ mod tests {
         }
         let listener = listener.expect("child must transfer its seccomp listener");
         let mut reads = 0;
-        let mut state = State::new(0);
+        let mut state = State::new(0, 10_000);
         let result = supervise_loop(child, &listener, &mut state, |state, notif| {
             state.emulate_with_reader(notif, |pid, address, len| {
                 // The fork preserves these addresses. Supply the known request
@@ -1594,6 +1774,9 @@ mod tests {
             &["-c".into(), "kill -TERM $$".into()],
         )
         .unwrap();
-        assert_eq!(run_supervisor(child, fd, 7).unwrap(), 128 + libc::SIGTERM);
+        assert_eq!(
+            run_supervisor(child, fd, 7, 10_000).unwrap(),
+            128 + libc::SIGTERM
+        );
     }
 }

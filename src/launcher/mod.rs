@@ -240,7 +240,7 @@ mod tests {
         assert!(notif_fd.as_raw_fd() >= 0);
 
         // Startup may issue getrandom, which must be serviced before waitpid.
-        let code = crate::supervisor::run_supervisor(child_pid, notif_fd, 0)
+        let code = crate::supervisor::run_supervisor(child_pid, notif_fd, 0, 10_000)
             .expect("supervisor should succeed");
         assert_eq!(code, 0);
     }

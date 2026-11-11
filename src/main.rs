@@ -16,6 +16,8 @@ enum Command {
     Run {
         #[arg(long, default_value_t = 0xDEADBEEF)]
         seed: u64,
+        #[arg(long, default_value_t = 10_000)]
+        quantum: u64,
         #[arg(required = true, num_args = 1.., last = true)]
         command: Vec<String>,
     },
@@ -23,11 +25,15 @@ enum Command {
 
 fn run() -> Result<i32> {
     match Cli::parse().command {
-        Command::Run { seed, command } => {
+        Command::Run {
+            seed,
+            quantum,
+            command,
+        } => {
             // The launcher accepts argv including argv[0]; preserve all target arguments.
             let (child, listener) =
                 statis::launcher::launch_child(Path::new(&command[0]), &command)?;
-            statis::supervisor::run_supervisor(child, listener, seed)
+            statis::supervisor::run_supervisor(child, listener, seed, quantum)
         }
     }
 }
