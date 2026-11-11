@@ -30,7 +30,7 @@ use crate::{
     },
     scheduler::{DeterministicScheduler, ThreadState as SchedulerThreadState, pmu},
     telemetry::ExecutionTelemetry,
-    trace::{TraceEvent, TraceHeader, TraceReader, TraceWriter},
+    trace::{TraceEvent, TraceHeader, TraceReader, TraceWriter, buffered_reader, buffered_writer},
     vm,
 };
 
@@ -67,6 +67,7 @@ struct State {
     pending_responses: VecDeque<seccomp_notif_resp>,
     tracees: BTreeSet<Pid>,
     new_tracees: BTreeSet<Pid>,
+    wait_scratch: Vec<Pid>,
 }
 
 trait MemoryReader {
@@ -77,6 +78,10 @@ trait MemoryReader {
         Ok(u32::from_ne_bytes(
             bytes.try_into().map_err(|_| Errno::EFAULT)?,
         ))
+    }
+
+    fn read_timespec(&mut self, pid: Pid, address: usize) -> nix::Result<libc::timespec> {
+        decode_timespec(&self.read_bytes(pid, address, std::mem::size_of::<libc::timespec>())?)
     }
 }
 
@@ -89,6 +94,12 @@ impl MemoryReader for RemoteMemory {
 
     fn read_u32(&mut self, pid: Pid, address: usize) -> nix::Result<u32> {
         vm::read_remote_val::<u32>(pid, address)
+    }
+
+    fn read_timespec(&mut self, pid: Pid, address: usize) -> nix::Result<libc::timespec> {
+        // The x86_64 ABI stores timespec as two consecutive signed 64-bit words.
+        let [tv_sec, tv_nsec] = vm::read_remote_val::<[i64; 2]>(pid, address)?;
+        Ok(libc::timespec { tv_sec, tv_nsec })
     }
 }
 
@@ -161,6 +172,7 @@ impl State {
             pending_responses: VecDeque::new(),
             tracees: BTreeSet::new(),
             new_tracees: BTreeSet::new(),
+            wait_scratch: Vec::new(),
         }
     }
 
@@ -375,27 +387,30 @@ impl State {
         false
     }
 
-    fn take_expired(&mut self) -> Vec<TimerEvent> {
-        let expired = self.wheel.pop_expired(self.clock.now_ns());
-        for event in &expired {
-            if self
-                .threads
-                .get(&event.tid)
-                .and_then(|state| state.notification())
-                == Some(event.notif_id)
-            {
-                let futex_timeout =
-                    self.threads[&event.tid] == ThreadState::FutexWaiting(event.notif_id);
-                self.futex_mgr.remove_by_notif_id(event.notif_id);
-                self.threads.insert(event.tid, ThreadState::Runnable);
-                self.pending_responses.push_back(seccomp_notif_resp {
-                    id: event.notif_id,
-                    error: if futex_timeout { -libc::ETIMEDOUT } else { 0 },
-                    ..Default::default()
-                });
-            }
+    fn expire_next(&mut self) -> Option<TimerEvent> {
+        let event = self.wheel.pop_next_expired(self.clock.now_ns())?;
+        if self
+            .threads
+            .get(&event.tid)
+            .and_then(|state| state.notification())
+            == Some(event.notif_id)
+        {
+            let futex_timeout =
+                self.threads[&event.tid] == ThreadState::FutexWaiting(event.notif_id);
+            self.futex_mgr.remove_by_notif_id(event.notif_id);
+            self.threads.insert(event.tid, ThreadState::Runnable);
+            self.pending_responses.push_back(seccomp_notif_resp {
+                id: event.notif_id,
+                error: if futex_timeout { -libc::ETIMEDOUT } else { 0 },
+                ..Default::default()
+            });
         }
-        expired
+        Some(event)
+    }
+
+    #[cfg(test)]
+    fn take_expired(&mut self) -> Vec<TimerEvent> {
+        std::iter::from_fn(|| self.expire_next()).collect()
     }
 
     fn emulate(&mut self, notif: &seccomp_notif) -> nix::Result<Option<seccomp_notif_resp>> {
@@ -447,7 +462,8 @@ impl State {
         // pid is the notifying thread ID, which can differ from the launched PID.
         let pid = Pid::from_raw(notif.pid as i32);
         let args = notif.data.args;
-        if IO_SYSCALLS.contains(&(notif.data.nr as u32))
+        if self.fault_config.is_enabled()
+            && IO_SYSCALLS.contains(&(notif.data.nr as u32))
             && let Some(err) =
                 self.fault_config
                     .should_fault(i64::from(notif.data.nr), &args, &mut self.rng)
@@ -527,12 +543,8 @@ impl State {
                 if args[2] == 0 {
                     response.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
                 } else {
-                    let bytes = read.read_bytes(
-                        pid,
-                        args[2] as usize,
-                        std::mem::size_of::<libc::timespec>(),
-                    )?;
-                    let timeout_ns = sleep_duration_ns(&decode_timespec(&bytes)?)?;
+                    let timeout_ns =
+                        sleep_duration_ns(&read.read_timespec(pid, args[2] as usize)?)?;
                     self.defer_timeout(notif, timeout_ns)?;
                     return Ok(None);
                 }
@@ -564,9 +576,7 @@ impl State {
                 } else {
                     args[2]
                 };
-                let bytes =
-                    read.read_bytes(pid, address as usize, std::mem::size_of::<libc::timespec>())?;
-                let req = decode_timespec(&bytes)?;
+                let req = read.read_timespec(pid, address as usize)?;
                 let sleep_ns = sleep_duration_ns(&req)?;
                 self.defer_timeout(notif, sleep_ns)?;
                 return Ok(None);
@@ -641,9 +651,7 @@ impl State {
                 }
                 // Validate everything before adding either queue entry.
                 let deadline = if timeout_addr != 0 {
-                    let bytes =
-                        read.read_bytes(pid, timeout_addr, std::mem::size_of::<libc::timespec>())?;
-                    let duration = sleep_duration_ns(&decode_timespec(&bytes)?)?;
+                    let duration = sleep_duration_ns(&read.read_timespec(pid, timeout_addr)?)?;
                     // WAIT uses a relative timeout; WAIT_BITSET uses an
                     // absolute deadline on the same virtual clock timeline.
                     let deadline = if op == libc::FUTEX_WAIT_BITSET {
@@ -784,6 +792,7 @@ fn handle_signal_stop(
             );
         }
         // Clock reads retain their 100 ns tick. Timestamp faults cost 50 ns.
+        state.telemetry.rdtsc_traps += 1;
         state
             .clock
             .advance_to(state.clock.now_ns().saturating_add(50));
@@ -804,7 +813,10 @@ fn drain_wait_events(child: Pid, state: &mut State) -> Result<Option<i32>> {
         let mut progress = false;
         // Wait only for this runtime's tasks; waitpid(-1) could steal unrelated
         // children, including children owned by concurrent library tests.
-        for tid in state.tracees.iter().copied().collect::<Vec<_>>() {
+        state.wait_scratch.clear();
+        state.wait_scratch.extend(state.tracees.iter().copied());
+        for index in 0..state.wait_scratch.len() {
+            let tid = state.wait_scratch[index];
             let status = match waitpid(tid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::__WALL)) {
                 Ok(WaitStatus::StillAlive) => continue,
                 Ok(status) => status,
@@ -958,7 +970,7 @@ fn reply(fd: RawFd, response: &seccomp_notif_resp) -> Result<()> {
 }
 
 fn wake_expired(state: &mut State, fd: RawFd) -> Result<()> {
-    state.take_expired();
+    while state.expire_next().is_some() {}
     flush_responses(state, fd)
 }
 
@@ -1117,12 +1129,12 @@ pub fn run_supervisor_with_config(
             TraceMode::None => (),
             TraceMode::Record(path) => {
                 state.trace_writer = Some(TraceWriter::new(
-                    BufWriter::new(File::create(path).context("creating trace")?),
+                    buffered_writer(File::create(path).context("creating trace")?),
                     trace_header,
                 )?)
             }
             TraceMode::Replay(path) => {
-                state.trace_reader = Some(TraceReader::new(BufReader::new(
+                state.trace_reader = Some(TraceReader::new(buffered_reader(
                     File::open(path).context("opening trace")?,
                 ))?)
             }
@@ -1532,6 +1544,7 @@ mod tests {
         }
         assert_eq!(state.clock.now_ns(), 100);
         assert_eq!(state.threads[&tid], ThreadState::Runnable);
+        assert_eq!(state.telemetry.rdtsc_traps, 2);
         assert_eq!(state.clock.advance_tick(), 200); // normal clock reads keep their tick
     }
 
@@ -1549,6 +1562,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("genuine SIGSEGV"));
         assert_eq!(state.clock.now_ns(), 0);
+        assert_eq!(state.telemetry.rdtsc_traps, 0);
     }
 
     #[test]

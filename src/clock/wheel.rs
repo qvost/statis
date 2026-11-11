@@ -44,13 +44,17 @@ impl TimeWheel {
 
     pub fn pop_expired(&mut self, current_time_ns: u64) -> Vec<TimerEvent> {
         let mut expired = Vec::new();
-        while self
-            .earliest_wake_time()
-            .is_some_and(|time| time <= current_time_ns)
-        {
-            expired.push(self.events.pop().expect("heap was just checked"));
+        while let Some(event) = self.pop_next_expired(current_time_ns) {
+            expired.push(event);
         }
         expired
+    }
+
+    pub(crate) fn pop_next_expired(&mut self, current_time_ns: u64) -> Option<TimerEvent> {
+        if self.events.peek()?.wake_time_ns > current_time_ns {
+            return None;
+        }
+        self.events.pop()
     }
 
     pub fn earliest_wake_time(&self) -> Option<u64> {

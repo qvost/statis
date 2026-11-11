@@ -5,6 +5,7 @@ use statis::{
     supervisor::{SupervisorConfig, TraceMode},
 };
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     process,
 };
@@ -81,7 +82,6 @@ fn fault_config(rate: f64, types: &str) -> Result<FaultConfig> {
 }
 
 fn execute(command: Vec<String>, mut config: SupervisorConfig, summary: bool) -> Result<i32> {
-    config.command = command.clone();
     let (child, listener) = statis::launcher::launch_child_with_options(
         Path::new(&command[0]),
         &command,
@@ -89,6 +89,7 @@ fn execute(command: Vec<String>, mut config: SupervisorConfig, summary: bool) ->
             intercept_io: config.fault_config.is_enabled(),
         },
     )?;
+    config.command = command;
     let mut telemetry = statis::telemetry::ExecutionTelemetry::default();
     let result =
         statis::supervisor::run_supervisor_with_config(child, listener, config, &mut telemetry);
@@ -137,7 +138,7 @@ fn run() -> Result<i32> {
             true,
         ),
         Command::Replay { trace, command } => {
-            let reader = statis::trace::TraceReader::new(std::io::BufReader::new(
+            let reader = statis::trace::TraceReader::new(statis::trace::buffered_reader(
                 std::fs::File::open(&trace)?,
             ))?;
             let recorded = reader.header();
@@ -158,8 +159,11 @@ fn run() -> Result<i32> {
         }
         Command::TraceDump { trace } => {
             let file = std::fs::File::open(trace)?;
-            let mut reader = statis::trace::TraceReader::new(std::io::BufReader::new(file))?;
-            statis::trace::dump_trace(&mut reader, &mut std::io::stdout().lock())?;
+            let mut reader = statis::trace::TraceReader::new(statis::trace::buffered_reader(file))?;
+            let stdout = std::io::stdout();
+            let mut out = statis::trace::buffered_writer(stdout.lock());
+            statis::trace::dump_trace(&mut reader, &mut out)?;
+            out.flush()?;
             Ok(0)
         }
     }

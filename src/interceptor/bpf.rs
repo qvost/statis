@@ -5,7 +5,7 @@ use super::notif::seccomp_data;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 // These are x86_64 syscall numbers, independent of the build host's ABI.
 const INTERCEPTED_SYSCALLS: [u32; 16] = [
-    228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271, 39, 110, 186, 62, 234,
+    228, 39, 186, 318, 202, 24, 96, 35, 230, 7, 232, 281, 271, 110, 62, 234,
 ];
 
 pub const IO_SYSCALLS: [u32; 9] = [0, 1, 42, 43, 44, 45, 46, 47, 288];
@@ -59,13 +59,22 @@ pub fn create_filter_prog_ext(intercept_io: bool) -> (Vec<libc::sock_filter>, li
         ),
     ];
 
-    let mut syscalls = INTERCEPTED_SYSCALLS.to_vec();
-    if intercept_io {
-        syscalls.extend(IO_SYSCALLS);
-    }
-    for (index, nr) in syscalls.iter().copied().enumerate() {
+    let (hot_io, remaining_io): (&[u32], &[u32]) = if intercept_io {
+        IO_SYSCALLS.split_at(2)
+    } else {
+        (&[], &[])
+    };
+    let syscall_count = hot_io.len() + INTERCEPTED_SYSCALLS.len() + remaining_io.len();
+    // Read/write lead I/O-enabled filters; common runtime calls precede the
+    // remaining socket operations. Compilation needs no temporary syscall Vec.
+    for (index, &nr) in hot_io
+        .iter()
+        .chain(&INTERCEPTED_SYSCALLS)
+        .chain(remaining_io)
+        .enumerate()
+    {
         // Skip the remaining comparisons and the ALLOW return on a match.
-        let jump_to_notify = (syscalls.len() - index) as u8;
+        let jump_to_notify = (syscall_count - index) as u8;
         filters.push(instruction(
             libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
             jump_to_notify,
@@ -139,9 +148,18 @@ mod tests {
     }
 
     fn evaluate_at(filters: &[libc::sock_filter], nr: i32, arch: u32, ip: u64) -> u32 {
+        evaluate_with_steps(filters, nr, arch, ip).0
+    }
+
+    fn evaluate_with_steps(
+        filters: &[libc::sock_filter],
+        nr: i32,
+        arch: u32,
+        ip: u64,
+    ) -> (u32, usize) {
         let mut accumulator = 0;
         let mut pc = 0;
-        for _ in 0..filters.len() {
+        for steps in 1..=filters.len() {
             let op = &filters[pc];
             match u32::from(op.code) {
                 code if code == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS => {
@@ -157,11 +175,32 @@ mod tests {
                 code if code == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K => {
                     pc += 1 + usize::from(if accumulator == op.k { op.jt } else { op.jf });
                 }
-                code if code == libc::BPF_RET | libc::BPF_K => return op.k,
+                code if code == libc::BPF_RET | libc::BPF_K => return (op.k, steps),
                 code => panic!("unexpected instruction {code}"),
             }
         }
         panic!("filter did not return");
+    }
+
+    #[test]
+    fn hot_syscalls_take_the_shortest_filter_paths() {
+        let ordered = [
+            228, 39, 186, 318, 202, 24, 96, 35, 230, 7, 232, 281, 271, 110, 62, 234,
+        ];
+        let (filters, _) = create_filter_prog();
+        for (rank, nr) in ordered.into_iter().enumerate() {
+            assert_eq!(
+                evaluate_with_steps(&filters, nr, AUDIT_ARCH_X86_64, 0),
+                (libc::SECCOMP_RET_USER_NOTIF, rank + 5)
+            );
+        }
+        let (filters, _) = create_filter_prog_ext(true);
+        for (rank, nr) in [0, 1].into_iter().chain(ordered).enumerate() {
+            assert_eq!(
+                evaluate_with_steps(&filters, nr, AUDIT_ARCH_X86_64, 0),
+                (libc::SECCOMP_RET_USER_NOTIF, rank + 5)
+            );
+        }
     }
 
     #[test]
@@ -171,7 +210,7 @@ mod tests {
         assert_eq!(program.filter.cast_const(), filters.as_ptr());
         for nr in (-1..1024).chain([i32::MIN, i32::MAX, 0x4000_0000 | 228]) {
             let expected = if [
-                228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271, 39, 110, 186, 62, 234,
+                228, 39, 186, 318, 202, 24, 96, 35, 230, 7, 232, 281, 271, 110, 62, 234,
             ]
             .contains(&nr)
             {
@@ -195,7 +234,7 @@ mod tests {
             assert_eq!(program.filter.cast_const(), filters.as_ptr());
             for nr in (-1..1024).chain([i32::MIN, i32::MAX, 0x4000_0000, 0x4000_0000 | 228]) {
                 let simulated = [
-                    228, 230, 35, 96, 318, 202, 24, 7, 232, 281, 271, 39, 110, 186, 62, 234,
+                    228, 39, 186, 318, 202, 24, 96, 35, 230, 7, 232, 281, 271, 110, 62, 234,
                 ]
                 .contains(&nr);
                 let io = [0, 1, 42, 43, 44, 45, 46, 47, 288].contains(&nr);

@@ -24,20 +24,24 @@ impl VirtualClock {
         }
     }
 
+    #[inline]
     pub fn now_ns(&self) -> u64 {
         self.virtual_time_ns
     }
 
     /// Advance one tick, saturating at the end of the representable timeline.
+    #[inline]
     pub fn advance_tick(&mut self) -> u64 {
         self.virtual_time_ns = self.virtual_time_ns.saturating_add(self.tick_step_ns);
         self.virtual_time_ns
     }
 
+    #[inline]
     pub fn advance_to(&mut self, target_ns: u64) {
         self.virtual_time_ns = self.virtual_time_ns.max(target_ns);
     }
 
+    #[inline]
     pub fn now_timespec(&self) -> libc::timespec {
         libc::timespec {
             tv_sec: (self.virtual_time_ns / 1_000_000_000) as _,
@@ -45,6 +49,7 @@ impl VirtualClock {
         }
     }
 
+    #[inline]
     pub fn now_timeval(&self) -> libc::timeval {
         libc::timeval {
             tv_sec: (self.virtual_time_ns / 1_000_000_000) as _,

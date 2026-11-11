@@ -2,7 +2,7 @@
 
 use std::{
     io::{IoSlice, IoSliceMut},
-    mem::size_of,
+    mem::{MaybeUninit, size_of},
 };
 
 use nix::{
@@ -43,8 +43,39 @@ pub fn read_remote_bytes(pid: Pid, remote_addr: usize, len: usize) -> nix::Resul
 
 /// Read a native value whose type permits every bit pattern.
 pub fn read_remote_val<T: bytemuck::AnyBitPattern>(pid: Pid, remote_addr: usize) -> nix::Result<T> {
-    let bytes = read_remote_bytes(pid, remote_addr, size_of::<T>())?;
-    Ok(bytemuck::pod_read_unaligned(&bytes))
+    let len = size_of::<T>();
+    check_range(remote_addr, len)?;
+    let mut val = MaybeUninit::<T>::uninit();
+    if len == 0 {
+        // SAFETY: a zero-sized AnyBitPattern value needs no initialized bytes.
+        return Ok(unsafe { val.assume_init() });
+    }
+    // Raw iovecs let the kernel initialize stack storage without creating a
+    // Rust byte slice over uninitialized memory.
+    let local = libc::iovec {
+        iov_base: val.as_mut_ptr().cast(),
+        iov_len: len,
+    };
+    let remote = libc::iovec {
+        iov_base: remote_addr as *mut libc::c_void,
+        iov_len: len,
+    };
+    loop {
+        // SAFETY: local covers writable storage for T. The kernel validates the
+        // remote address and reports the exact number of bytes initialized.
+        let count = unsafe { libc::process_vm_readv(pid.as_raw(), &local, 1, &remote, 1, 0) };
+        if count >= 0 {
+            if count as usize != len {
+                return Err(Errno::EFAULT);
+            }
+            // SAFETY: all bytes were initialized; AnyBitPattern accepts them.
+            return Ok(unsafe { val.assume_init() });
+        }
+        let error = Errno::last();
+        if error != Errno::EINTR {
+            return Err(error);
+        }
+    }
 }
 
 /// Write all bytes, returning EFAULT for a partial transfer.
@@ -123,6 +154,60 @@ pub(crate) fn memory_access_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_reads_accept_unaligned_input_and_reject_partial_values() {
+        if !memory_access_available() {
+            return;
+        }
+        let bytes = [0_u8, 1, 2, 3, 4];
+        assert_eq!(
+            read_remote_val::<u32>(Pid::this(), bytes[1..].as_ptr() as usize).unwrap(),
+            u32::from_ne_bytes([1, 2, 3, 4])
+        );
+        // SAFETY: sysconf has no pointer arguments.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page = page as usize;
+        struct Mapping(*mut libc::c_void, usize);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: this mapping was allocated below with this length.
+                unsafe {
+                    libc::munmap(self.0, self.1);
+                }
+            }
+        }
+        // SAFETY: anonymous private mapping, no file descriptor or input memory.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let mapping = Mapping(ptr, page * 2);
+        // SAFETY: second_page is an aligned page wholly inside this mapping.
+        let second_page = unsafe { mapping.0.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe { libc::mprotect(second_page.cast(), page, libc::PROT_NONE) },
+            0
+        );
+        let address = second_page as usize - size_of::<u64>();
+        // The first word is readable; the second lies in the protected page.
+        assert_eq!(
+            read_remote_val::<[u64; 2]>(Pid::this(), address),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(
+            read_remote_bytes(Pid::this(), address, 16),
+            Err(Errno::EFAULT)
+        );
+    }
 
     #[test]
     fn memory_round_trip() {

@@ -1,153 +1,136 @@
 # statis
 
-`statis` is a deterministic userspace execution supervisor for unmodified, multi-threaded Linux x86-64 ELF binaries.
+Run Linux x86-64 programs with virtual time, seeded randomness, and tracked process identities. `statis` is a userspace supervisor for timer experiments, concurrency tests, and reproducible I/O fault injection.
 
-It eliminates sources of non-determinism—ambient time reads, kernel entropy, thread scheduling races, and memory layout—by running the target process tree under single-core affinity, neutralizing vDSO lookups, and virtualizing sensitive syscalls via `SECCOMP_RET_USER_NOTIF`.
+The runtime is under development. Its intercepted operations are covered by unit tests; complete instruction-level scheduling and application compatibility still need validation. See the [review and benchmark notes](docs/benchmarking.md) for the current limits and measured results.
 
 ## Overview
 
-Concurrent software (databases, distributed state machines, actor runtimes) frequently experiences bugs that are sensitive to thread scheduling interleavings, clock resolution, and timer expirations. Reproducing these issues under standard Linux execution is difficult because:
+Concurrent programs depend on inputs that are difficult to reproduce:
 
-1. **Host Time Leakage**: `clock_gettime` and `gettimeofday` query the vDSO directly, bypassing system calls and returning variable host wall-clock time.
-2. **Entropy**: `getrandom` and `/dev/urandom` sample hardware noise and kernel entropy pools.
-3. **Preemption**: The kernel scheduler preempts threads asynchronously across multiple CPU cores.
-4. **Address Space Randomization**: ASLR shifts memory layout between runs.
+1. Time reads can bypass syscalls through the vDSO.
+2. `getrandom` draws from the kernel entropy pool.
+3. Threads run according to the host scheduler.
+4. ASLR changes memory addresses between runs.
 
-`statis` intercepts these inputs and virtualizes them against a single 64-bit seed. Given the same binary, arguments, and seed, execution traces remain reproducible.
+`statis` controls selected inputs using seccomp notifications, ptrace, and a seeded ChaCha20 generator. Reproducibility depends on which operations the target uses; a fixed seed does not yet control every userspace instruction interleaving.
 
-## How It Works
+## How it works
 
-### Isolation Boundary
-Before executing the target binary, `statis`:
-- Disables ASLR using `personality(ADDR_NO_RANDOMIZE)`.
-- Pins execution to a single core using `sched_setaffinity` to eliminate hardware memory races.
-- Installs a classic BPF filter configured with `SECCOMP_FILTER_FLAG_NEW_LISTENER` to route filtered syscalls to a userspace notification file descriptor (`notif_fd`), transmitted to the supervisor over a `SCM_RIGHTS` Unix socket.
-- Traps `execve` via `PTRACE_TRACEME` to inspect the initial stack and scrub `AT_SYSINFO_EHDR` (type 33) from the ELF auxiliary vector (`auxv`). Without the vDSO header, dynamic linkers (`ld-linux`) fall back to issuing real syscall instructions for time lookups.
+### Isolation boundary
 
-### Syscall Emulation & Virtual Time
-When a trapped syscall is executed, the kernel pauses the thread and notifies `statis`:
-- **`SYS_clock_gettime` / `SYS_gettimeofday`**: Advances a monotonic virtual clock by a configurable tick quantum (default 100ns) and writes synthetic `timespec` / `timeval` structures directly into the target's address space via `process_vm_writev`.
-- **`SYS_getrandom`**: Fills target buffers with bytes from a ChaCha20 PRNG seeded from `--seed`.
-- **`SYS_nanosleep` / `SYS_clock_nanosleep`**: Enqueues a deadline in a min-heap time wheel. If all runnable threads in the target process tree are sleeping or blocked, `statis` warps the virtual clock directly to the next scheduled deadline without waiting in wall-clock time.
-- **`SYS_futex` / `SYS_sched_yield`**: Coordinates thread descheduling and wait queues to maintain deterministic lock acquisition order, including kernel `CLONE_CHILD_CLEARTID` exits.
-- **Hardware RDTSC / RDTSCP**: Inline assembly reads of the timestamp counter fault into `SIGSEGV` via `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)`, where `statis` catches the fault, virtualizes `RAX:RDX` from the virtual clock, sets synthetic core ID in `RCX`, advances `RIP`, and resumes seamlessly.
-- **Process Hierarchy & Synthetic PID Virtualization**: Virtualizes `SYS_getpid` (root PID `1000`, PPID `999`), `SYS_getppid`, and `SYS_gettid`, allocating deterministic monotonic IDs for forked processes (`1001`, `1002`, ...) while translating `SYS_kill` / `SYS_tgkill` to underlying OS processes. Neutralizes vDSO across `execve` boundaries via ptrace.
+Before the target starts, the launcher:
+
+- Requests disabled ASLR with `personality(ADDR_NO_RANDOMIZE)`.
+- Pins execution to CPU 0.
+- Installs a classic BPF filter and transfers its seccomp listener over a Unix socket.
+- Stops at exec and replaces `AT_SYSINFO_EHDR` with `AT_IGNORE` in the initial ELF auxiliary vector, making the dynamic loader fall back to syscall-based clock reads.
+- Enables RDTSC/RDTSCP traps and retains ptrace control across thread creation and exec.
+
+### Syscall emulation and virtual time
+
+| Operation | Behavior |
+| --- | --- |
+| `clock_gettime`, `gettimeofday` | Advance virtual time by 100 ns and write the result into target memory. |
+| `getrandom` | Fill the target buffer with bytes from the seeded PRNG. Reads from `/dev/urandom` are outside this emulation. |
+| `nanosleep`, `clock_nanosleep` | Queue a deadline; advance to the next deadline when the supervisor finds no runnable work. |
+| `poll`, `epoll_wait`, `epoll_pwait`, `ppoll` | Synthesize finite timeout completion. Nonblocking and infinite waits use the kernel where specified. Finite waits currently do not simulate descriptor readiness. |
+| `futex`, `sched_yield` | Maintain FIFO wait queues, virtual timeouts, and seeded runnable-thread selection. Thread exits can release intercepted join waits. |
+| RDTSC, RDTSCP | Return the current virtual time as cycles, set RDTSCP core ID to 0, and advance virtual time by 50 ns. |
+| `getpid`, `getppid`, `gettid` | Return virtual IDs; the root process uses PID 1000 and PPID 999. |
+
+The PMU interface and `--quantum` setting support ongoing scheduler work. The supervisor does not yet enforce a complete PMU-driven instruction preemption loop.
 
 ## Building
 
-Requires a Linux x86-64 host with kernel >= 5.6 (`SECCOMP_RET_USER_NOTIF`).
+The project targets Linux x86-64 with kernel 5.6 or newer. The host must allow seccomp user notifications, ptrace, remote memory transfers, ASLR configuration, and affinity to CPU 0. Containers may restrict these operations.
 
 ```bash
-cargo build --release
+cargo build --release --bins
 ```
+
+Release builds use optimization level 3, fat LTO, one codegen unit, abort-on-panic, and stripped symbols. Trace file streams use 64 KiB buffers.
 
 ## Usage
 
 ```bash
-statis run [--seed <u64>] [--quantum <u64>] [--fault-rate <f64>] [--fault-types <types>] [--summary] -- <command> [args...]
+statis run --seed 42 -- ./target/debug/test_target
+statis run --summary=false -- ./target/debug/test_concurrency
+statis run --help
 ```
 
-Example:
+The default seed is `0xDEADBEEF`. `--quantum` defaults to 10,000 instructions for the experimental PMU interface. Target output goes to stdout; the execution summary goes to stderr.
+
+### Time warping
+
+Build the fixture binaries, then run a sleep or event-loop timeout:
 
 ```bash
-# Run target with a fixed seed and 10,000 instruction quantum
-statis run --seed 12345 --quantum 10000 -- ./target/debug/test_target
+cargo build --bins
+./target/release/statis run --seed 42 -- ./target/debug/test_timewarp
+./target/release/statis run --seed 42 -- ./target/debug/test_epoll
 ```
 
-### Time Warping
+The summary reports virtual seconds and elapsed seconds separately. Its `Virtual / elapsed` ratio describes how much virtual time advanced per elapsed second; it is not a comparison against an unsupervised execution.
 
-Sleep calls bypass real-world delays when no other threads have work pending:
+Current benchmark attempts and host restrictions are recorded in [docs/benchmarking.md](docs/benchmarking.md). No target latency is claimed without a completed run.
+
+### Deterministic fault injection
 
 ```bash
-$ time statis run --seed 42 -- ./target/debug/test_timewarp
-[TimeWarp Target] Starting 10-second nanosleep...
-[TimeWarp Target] Woke up successfully!
-==================== statis execution summary ====================
-Virtual timeline:    10.000 s
-Wall-clock elapsed:  0.023 s (438.1x time-warp speedup)
-Syscalls trapped:
-  • clock_nanosleep: 1
-  • getrandom: 2
-Hardware RDTSC traps: 0
-Context switches:    0
-Exit code:           0
-==================================================================
-
-real    0m0.025s
-user    0m0.003s
-sys     0m0.022s
+statis run --seed 42 --fault-rate 0.3 --fault-types econnreset,etimedout,eagain -- ./target/debug/test_fault_injection
 ```
 
-### Deterministic Fault Injection
+Each eligible I/O call draws from the seeded PRNG. Selected failures return a configured errno. `read` and `write` on file descriptors 0, 1, and 2 are protected so standard streams remain available. The summary reports the number of injected failures by syscall.
 
-Inject transient network and I/O failures probabilistically from the seeded PRNG:
-
-```bash
-$ statis run --seed 42 --fault-rate 0.3 -- ./target/debug/test_fault_injection
-[Fault Target] Operations: 50 | Successes: 50 | Injected faults: 50 (codes: [110, 104, 110, ...])
-==================== statis execution summary ====================
-Virtual timeline:    0.000 s
-Wall-clock elapsed:  0.017 s (0.0x time-warp speedup)
-Syscalls trapped:
-  • getrandom: 2
-  • poll: 1
-  • read: 55
-  • write: 51
-Faults injected:     38
-  • read: 17
-  • write: 21
-Hardware RDTSC traps: 0
-Context switches:    0
-Exit code:           0
-==================================================================
-```
-
-Standard streams (`stdin`, `stdout`, `stderr`) are protected from injection so console output remains undisturbed. Repeating the command with `--seed 42` reproduces the identical sequence of injected errors.
-
-### Compact Trace Recording & Deterministic Replay
-
-Record execution into a portable, zero-overhead binary trace and replay it to verify exact execution parity:
+### Trace recording and replay
 
 ```bash
-# Record execution to trace file
 statis record --trace exec.trace --seed 42 -- ./target/debug/test_record_replay
-
-# Replay against recorded trace (detects any divergence down to timestamp and syscall)
 statis replay --trace exec.trace -- ./target/debug/test_record_replay
-
-# Inspect human-readable chronological event stream
 statis trace-dump exec.trace
 ```
 
-## Project Structure
+Traces store configuration, command arguments, syscall responses, timestamp reads, and task exits in a versioned little-endian format. Replay checks the event sequence and selected arguments, and reports divergence. It is not yet a complete record of target memory or kernel-side I/O results.
 
-```
+Trace dumps keep one event per line, explicit virtual-time units, and hexadecimal syscall arguments. Exit lines inherit the last recorded timestamp.
+
+## Project structure
+
+```text
 src/
-├── main.rs           CLI entrypoint and option parsing
-├── lib.rs            Library exports
-├── clock/            Monotonic virtual clock and min-heap time wheel
-├── interceptor/      Classic BPF compiler, seccomp notification ABI, futex sync, fault injection, and RDTSC emulation
-├── launcher/         Process isolation, auxv vDSO scrubbing, and socketpair fd passing
-├── scheduler/        PMU instruction counting (perf_event_open) and thread pool
-├── telemetry.rs      Execution metrics and performance profiling
-├── trace/            Compact binary trace serialization, reader/writer, and event dumper
-└── vm.rs             Remote process memory access (process_vm_readv / writev)
+  main.rs         Command parsing and trace-dump output
+  clock/          Virtual clock and deadline heap
+  interceptor/    BPF, seccomp ABI, futexes, faults, IDs, and TSC emulation
+  launcher/       Process setup, auxv scrubbing, and listener transfer
+  scheduler/      Seeded thread selection and PMU support
+  supervisor.rs   Notification, signal, and timer event loop
+  telemetry.rs    Execution statistics
+  trace/          Binary trace reader, writer, and dumper
+  vm.rs           Remote process memory access
+
 tests/
-├── test_target.rs          Multi-threaded getrandom and clock_gettime verification
-├── test_timewarp.rs        Time warping validation (10s nanosleep)
-├── test_concurrency.rs     4-thread mutex contention benchmark
-├── test_rdtsc.rs           Direct x86-64 rdtsc/rdtscp assembly trap verification
-├── test_epoll.rs           Epoll wait time warping verification
-├── test_fault_injection.rs Seed-reproducible socket/pipe fault injection
-├── test_process_tree.rs    Multi-process hierarchy and synthetic PID verification
-└── test_record_replay.rs   Deterministic trace record and replay verification
+  test_target.rs           Randomness and clock fixture
+  test_timewarp.rs         Ten-second sleep fixture
+  test_concurrency.rs      Four-thread mutex fixture
+  test_rdtsc.rs            RDTSC/RDTSCP fixture
+  test_epoll.rs            Fifteen-second epoll timeout fixture
+  test_fault_injection.rs  I/O fault fixture
+  test_process_tree.rs     Process identity fixture
+  test_record_replay.rs    Record/replay fixture
 ```
 
-## Running Tests
+## Running tests
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
+
+Tests that need ptrace or remote-memory access report a capability skip when the host denies access. A passing unit suite alone does not establish that the supervised benchmark targets ran on that host.
+
+The [interface notes](docs/interface.md) document the terminal presentation pass and credit its source.
 
 ## License
 

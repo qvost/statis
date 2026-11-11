@@ -9,7 +9,7 @@ use crate::vm;
 /// Returns false without changing registers for any other instruction.
 pub fn handle_tsc_fault(pid: Pid, virtual_cycles: u64) -> Result<bool> {
     let mut regs = ptrace::getregs(pid).context("reading registers at TSC fault")?;
-    let bytes = vm::read_remote_bytes(pid, regs.rip as usize, 3)
+    let bytes = vm::read_remote_val::<[u8; 3]>(pid, regs.rip as usize)
         .context("reading instruction at TSC fault")?;
     if !emulate_instruction(&mut regs, &bytes, virtual_cycles) {
         return Ok(false);

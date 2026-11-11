@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    io::{self, Write},
     time::{Duration, Instant},
 };
 
@@ -33,14 +34,16 @@ impl ExecutionTelemetry {
         use std::fmt::Write;
         let mut output = String::new();
         if self.faults_injected > 0 {
+            writeln!(output, "\nFaults").unwrap();
             writeln!(
                 output,
-                "Faults injected:     {}",
+                "  {:<20} {:>12}",
+                "Injected",
                 grouped(self.faults_injected)
             )
             .unwrap();
             for (name, count) in &self.fault_counts {
-                writeln!(output, "  • {name}: {}", grouped(*count)).unwrap();
+                writeln!(output, "  {name:<20} {:>12}", grouped(*count)).unwrap();
             }
         }
         output
@@ -54,30 +57,61 @@ impl ExecutionTelemetry {
     }
 
     pub fn print_summary(&self) {
+        // Summary output is best effort; a closed stderr must not change the
+        // target's exit status. The fallible writer API is available to callers.
+        let stderr = io::stderr();
+        let _ = self.write_summary(&mut stderr.lock());
+    }
+
+    pub fn write_summary(&self, out: &mut impl Write) -> io::Result<()> {
         let virtual_seconds =
             self.virtual_end_ns.saturating_sub(self.virtual_start_ns) as f64 / 1e9;
-        eprintln!("==================== statis execution summary ====================");
-        eprintln!("Virtual timeline:    {virtual_seconds:.3} s");
+        writeln!(out, "statis execution")?;
+        writeln!(out, "  {:<20} {virtual_seconds:>12.3} s", "Virtual time")?;
         match self.real_duration {
-            Some(duration) if !duration.is_zero() => eprintln!(
-                "Wall-clock elapsed:  {:.3} s ({:.1}x time-warp speedup)",
-                duration.as_secs_f64(),
-                virtual_seconds / duration.as_secs_f64()
-            ),
-            Some(_) => eprintln!("Wall-clock elapsed:  0.000 s"),
-            None => eprintln!("Wall-clock elapsed:  unavailable"),
+            Some(duration) => {
+                writeln!(
+                    out,
+                    "  {:<20} {:>12.3} s",
+                    "Elapsed",
+                    duration.as_secs_f64()
+                )?;
+                if !duration.is_zero() {
+                    writeln!(
+                        out,
+                        "  {:<20} {:>12.1}x",
+                        "Virtual / elapsed",
+                        virtual_seconds / duration.as_secs_f64()
+                    )?;
+                }
+            }
+            None => writeln!(out, "  {:<20} {:>12}", "Elapsed", "unavailable")?,
         }
-        eprintln!("Syscalls trapped:");
+        writeln!(out, "\nSyscalls")?;
+        if self.syscall_counts.is_empty() {
+            writeln!(out, "  No trapped syscalls")?;
+        }
         for (name, count) in &self.syscall_counts {
-            eprintln!("  • {name}: {}", grouped(*count));
+            writeln!(out, "  {name:<20} {:>12}", grouped(*count))?;
         }
-        eprint!("{}", self.fault_summary());
-        eprintln!("Hardware RDTSC traps: {}", grouped(self.rdtsc_traps));
-        eprintln!("Context switches:    {}", grouped(self.context_switches));
+        write!(out, "{}", self.fault_summary())?;
+        writeln!(out, "\nRuntime")?;
+        writeln!(
+            out,
+            "  {:<20} {:>12}",
+            "RDTSC traps",
+            grouped(self.rdtsc_traps)
+        )?;
+        writeln!(
+            out,
+            "  {:<20} {:>12}",
+            "Context switches",
+            grouped(self.context_switches)
+        )?;
         if let Some(code) = self.exit_code {
-            eprintln!("Exit code:           {code}");
+            writeln!(out, "  {:<20} {code:>12}", "Exit code")?;
         }
-        eprintln!("==================================================================");
+        Ok(())
     }
 }
 
@@ -107,7 +141,12 @@ mod tests {
         assert_eq!(telemetry.faults_injected, 1_235);
         assert_eq!(
             telemetry.fault_summary(),
-            "Faults injected:     1,235\n  • read: 1,234\n  • write: 1\n"
+            concat!(
+                "\nFaults\n",
+                "  Injected                    1,235\n",
+                "  read                        1,234\n",
+                "  write                           1\n"
+            )
         );
     }
     #[test]
