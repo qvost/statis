@@ -1,7 +1,7 @@
 //! Deterministic emulation of syscalls delivered by a seccomp listener.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
@@ -112,8 +112,18 @@ impl State {
     }
 
     fn refresh_threads(&mut self, tasks: BTreeMap<Pid, bool>) {
+        self.refresh_threads_with_memory(tasks, &mut RemoteMemory);
+    }
+
+    fn refresh_threads_with_memory(
+        &mut self,
+        tasks: BTreeMap<Pid, bool>,
+        read: &mut impl MemoryReader,
+    ) {
+        let mut exited = BTreeSet::new();
         for (tid, state) in &self.threads {
             if !tasks.contains_key(tid) {
+                exited.insert(tid.as_raw() as u32);
                 if let Some(id) = state.notification() {
                     self.futex_mgr.remove_by_notif_id(id);
                 }
@@ -132,6 +142,28 @@ impl State {
         }
         self.wheel
             .retain(|event| self.threads.contains_key(&event.tid));
+
+        let woken = self.futex_mgr.waiters_for_each(|waiter| {
+            // clear_child_tid is an implicit kernel wake, so no FUTEX_WAKE
+            // notification will arrive. A nonzero expected word becoming zero
+            // also covers workers that exited before we first observed them.
+            exited.contains(&waiter.expected_val)
+                || (waiter.expected_val != 0 && read.read_u32(waiter.tid, waiter.uaddr) == Ok(0))
+        });
+        for waiter in woken {
+            self.wake_futex_waiter(waiter);
+        }
+    }
+
+    fn wake_futex_waiter(&mut self, waiter: FutexWaiter) {
+        self.wheel.retain(|event| event.notif_id != waiter.notif_id);
+        if self.threads.get(&waiter.tid) == Some(&ThreadState::FutexWaiting(waiter.notif_id)) {
+            self.threads.insert(waiter.tid, ThreadState::Runnable);
+            self.pending_responses.push_back(seccomp_notif_resp {
+                id: waiter.notif_id,
+                ..Default::default()
+            });
+        }
     }
 
     fn cancel_invalid_notifications(&mut self, mut valid: impl FnMut(u64) -> bool) {
@@ -334,6 +366,8 @@ impl State {
                         tid: pid,
                         notif_id: notif.id,
                         bitset,
+                        uaddr,
+                        expected_val: val,
                     },
                 );
                 if let Some(wake_time_ns) = deadline {
@@ -351,12 +385,7 @@ impl State {
                 let woken = self.futex_mgr.wake(uaddr, val as usize, bitset);
                 response.val = woken.len() as i64;
                 for waiter in woken {
-                    self.wheel.retain(|event| event.notif_id != waiter.notif_id);
-                    self.threads.insert(waiter.tid, ThreadState::Runnable);
-                    self.pending_responses.push_back(seccomp_notif_resp {
-                        id: waiter.notif_id,
-                        ..Default::default()
-                    });
+                    self.wake_futex_waiter(waiter);
                 }
             }
             _ => response.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE,
@@ -496,13 +525,15 @@ fn supervise_loop(
         // First drain pending notifications, including those from previously
         // unseen threads, before considering an idle-time warp.
         let mut revents = poll_listener(fd, 0)?;
-        if revents == 0 && !state.wheel.is_empty() {
+        if revents == 0 && (!state.wheel.is_empty() || !state.futex_mgr.is_empty()) {
             match thread_snapshot(child) {
                 Ok(tasks) => state.refresh_threads(tasks),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error).context("reading child thread states"),
             }
             state.cancel_invalid_notifications(|id| is_id_valid(fd, id));
+            // Exit wakes must be delivered even for joins with no timeout.
+            flush_responses(state, fd)?;
             // Task states and notification readiness are sampled separately.
             // Recheck readiness after the snapshot to avoid skipping a request.
             revents = poll_listener(fd, 0)?;
@@ -514,7 +545,14 @@ fn supervise_loop(
         if revents == 0 {
             // Polling bounds exit detection; pending timers also need frequent
             // task-state refreshes for threads entering an untrapped futex wait.
-            revents = poll_listener(fd, if state.wheel.is_empty() { 50 } else { 1 })?;
+            revents = poll_listener(
+                fd,
+                if state.wheel.is_empty() && state.futex_mgr.is_empty() {
+                    50
+                } else {
+                    1
+                },
+            )?;
         }
         if revents == 0 {
             continue;
@@ -619,6 +657,125 @@ mod tests {
                 _ => panic!("unexpected memory read at {address:#x}, length {len}"),
             }
         })
+    }
+
+    #[test]
+    fn exiting_worker_wakes_join_and_cancels_any_timeout() {
+        for timeout in [0, 0x2000] {
+            let mut state = State::new(0);
+            let join = futex_notification(
+                1,
+                101,
+                [
+                    0x1000,
+                    (libc::FUTEX_WAIT_BITSET | libc::FUTEX_CLOCK_REALTIME) as u64,
+                    7,
+                    timeout,
+                    0,
+                    u32::MAX as u64,
+                ],
+            );
+            assert!(
+                emulate_futex_request(&mut state, &join, 7, (10, 0))
+                    .unwrap()
+                    .is_none()
+            );
+            state
+                .threads
+                .insert(Pid::from_raw(7), ThreadState::Runnable);
+            state.refresh_threads_with_memory(
+                BTreeMap::from([(Pid::from_raw(1), false)]),
+                &mut |_, _, _| -> nix::Result<Vec<u8>> {
+                    panic!("known exited TID needs no memory read")
+                },
+            );
+            assert_eq!(state.threads[&Pid::from_raw(1)], ThreadState::Runnable);
+            assert!(!state.threads.contains_key(&Pid::from_raw(7)));
+            assert!(state.futex_mgr.is_empty());
+            assert!(state.wheel.is_empty());
+            let reply = state.pending_responses.pop_front().unwrap();
+            assert_eq!(
+                (reply.id, reply.val, reply.error, reply.flags),
+                (101, 0, 0, 0)
+            );
+            state.clock.advance_to(20_000_000_000);
+            assert!(state.take_expired().is_empty());
+            state.refresh_threads_with_memory(
+                BTreeMap::from([(Pid::from_raw(1), true)]),
+                &mut |_, _, _| -> nix::Result<Vec<u8>> { panic!("wait was already removed") },
+            );
+            assert!(state.pending_responses.is_empty());
+        }
+    }
+
+    #[test]
+    fn cleared_tid_wakes_even_if_worker_exited_before_discovery() {
+        let mut state = State::new(0);
+        let join = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 7, 0, 0, 0]);
+        emulate_futex_request(&mut state, &join, 7, (0, 0)).unwrap();
+        state.refresh_threads_with_memory(
+            BTreeMap::from([(Pid::from_raw(1), false)]),
+            &mut |pid, address, len| {
+                assert_eq!((pid, address, len), (Pid::from_raw(1), 0x1000, 4));
+                Ok(0_u32.to_ne_bytes().to_vec())
+            },
+        );
+        assert!(state.futex_mgr.is_empty());
+        assert_eq!(state.pending_responses.pop_front().unwrap().id, 101);
+    }
+
+    #[test]
+    fn live_or_unreadable_futex_words_remain_waiting() {
+        let mut state = State::new(0);
+        let join = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 7, 0, 0, 0]);
+        emulate_futex_request(&mut state, &join, 7, (0, 0)).unwrap();
+        let tasks = BTreeMap::from([(Pid::from_raw(1), false)]);
+        state.refresh_threads_with_memory(tasks.clone(), &mut |_, _, _| {
+            Ok(7_u32.to_ne_bytes().to_vec())
+        });
+        state.refresh_threads_with_memory(tasks, &mut |_, _, _| Err(Errno::EFAULT));
+        assert_eq!(
+            state.threads[&Pid::from_raw(1)],
+            ThreadState::FutexWaiting(101)
+        );
+        assert!(!state.futex_mgr.is_empty());
+        assert!(state.pending_responses.is_empty());
+    }
+
+    #[test]
+    fn unrelated_exit_does_not_wake_an_unchanged_zero_wait() {
+        let mut state = State::new(0);
+        let wait = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 0, 0, 0, 0]);
+        emulate_futex_request(&mut state, &wait, 0, (0, 0)).unwrap();
+        state
+            .threads
+            .insert(Pid::from_raw(7), ThreadState::Runnable);
+        state.refresh_threads_with_memory(
+            BTreeMap::from([(Pid::from_raw(1), false)]),
+            &mut |_, _, _| Ok(0_u32.to_ne_bytes().to_vec()),
+        );
+        assert_eq!(
+            state.threads[&Pid::from_raw(1)],
+            ThreadState::FutexWaiting(101)
+        );
+        assert!(!state.futex_mgr.is_empty());
+        assert!(state.pending_responses.is_empty());
+    }
+
+    #[test]
+    fn dead_waiter_is_removed_without_sending_a_response() {
+        let mut state = State::new(0);
+        let wait = futex_notification(1, 101, [0x1000, libc::FUTEX_WAIT as u64, 7, 0x2000, 0, 0]);
+        emulate_futex_request(&mut state, &wait, 7, (10, 0)).unwrap();
+        state.refresh_threads_with_memory(BTreeMap::new(), &mut |_,
+                                                                 _,
+                                                                 _|
+         -> nix::Result<Vec<u8>> {
+            panic!("dead waiter's memory must not be read")
+        });
+        assert!(state.futex_mgr.is_empty());
+        assert!(state.wheel.is_empty());
+        assert!(state.pending_responses.is_empty());
     }
 
     #[test]
