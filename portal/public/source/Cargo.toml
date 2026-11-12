@@ -1,0 +1,69 @@
+[package]
+name = "statis"
+version = "0.1.0"
+edition = "2024"
+# tests/test_target.rs is explicitly built as a helper binary below.
+autotests = false
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["process", "ptrace", "sched", "signal", "mman", "uio", "ioctl", "time", "socket", "net"] }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+bytemuck = { version = "1.14", features = ["derive"] }
+bitflags = "2.4"
+
+[[bin]]
+name = "statis"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_target"
+test = false
+path = "tests/test_target.rs"
+
+[[bin]]
+name = "test_timewarp"
+test = false
+path = "tests/test_timewarp.rs"
+
+[[bin]]
+name = "test_concurrency"
+test = false
+path = "tests/test_concurrency.rs"
+
+[[bin]]
+name = "test_rdtsc"
+test = false
+path = "tests/test_rdtsc.rs"
+
+[[bin]]
+name = "test_fault_injection"
+test = false
+path = "tests/test_fault_injection.rs"
+
+[[bin]]
+name = "test_epoll"
+test = false
+path = "tests/test_epoll.rs"
+
+[[bin]]
+name = "test_record_replay"
+test = false
+path = "tests/test_record_replay.rs"
+
+[[bin]]
+name = "test_process_tree"
+test = false
+path = "tests/test_process_tree.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

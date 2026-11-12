@@ -1,0 +1,17 @@
+'use client';
+import { useEffect, useRef } from 'react';
+import { PortalLink } from './PortalShell';
+function HalftoneField() { const ref = useRef<HTMLCanvasElement>(null); useEffect(() => { const c = ref.current!, ctx = c.getContext('2d'); if (!ctx)
+    return; let w = 0, h = 0, frame = 0, visible = false; const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches; const draw = (t: number) => { ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#d1d9b8'; for (let x = 0; x < w; x += 4) {
+    const u = x / w, peak = Math.abs(Math.sin(u * 9.4 + .8)) * .44 + Math.abs(Math.sin(u * 27.1)) * .12 + Math.sin(u * 71) * .018;
+    const ridge = h * (.83 - peak);
+    const wave = Math.sin(u * 28 - t * .00012) * h * .025;
+    ctx.fillRect(x, ridge + wave, 1.25, h - ridge - wave);
+    if (x % 16 === 0) {
+        const pulse = Math.pow(Math.max(0, Math.sin(u * 43 - t * .0003)), 8) * h * .14;
+        ctx.fillRect(x, h * .83 - pulse, 2, pulse);
+    }
+} if (!reduced && visible)
+    frame = requestAnimationFrame(draw); }; const resize = new ResizeObserver(() => { const r = c.getBoundingClientRect(); w = r.width; h = r.height; const d = Math.min(devicePixelRatio, 1.5); c.width = w * d; c.height = h * d; ctx.setTransform(d, 0, 0, d, 0, 0); cancelAnimationFrame(frame); draw(0); }); resize.observe(c); const observer = new IntersectionObserver(([e]) => { visible = e.isIntersecting; cancelAnimationFrame(frame); if (visible)
+    draw(0); }); observer.observe(c); return () => { cancelAnimationFrame(frame); resize.disconnect(); observer.disconnect(); }; }, []); return <canvas ref={ref} className="htsf-field" aria-hidden="true"/>; }
+export function HalftoneSceneFooter() { return <footer className="htsf-root" data-surface="black"><div className="htsf-top"><div className="htsf-brand">QVOST<span>®</span></div><div><span className="eyebrow">RESEARCHER</span><p>Siddid Pandey<br />Independent Systems Researcher<br />Kathmandu, Nepal</p></div><div><span className="eyebrow">ECOSYSTEM & PROFILES</span><a href="https://github.com/qvost" target="_blank" rel="noreferrer">GitHub · github.com/qvost ↗</a><a href="https://linkedin.com/in/qvost" target="_blank" rel="noreferrer">LinkedIn · linkedin.com/in/qvost ↗</a><a href="https://x.com/qvostlost" target="_blank" rel="noreferrer">X · x.com/qvostlost ↗</a><div className="ecosystem-pills">{['statis', 'strata', 'nitro-fan', 'samayamiiti'].map(x => <a href={`https://github.com/qvost/${x}`} key={x} target="_blank" rel="noreferrer">{x} ↗</a>)}</div></div></div><div className="htsf-contacts"><div><a href="https://github.com/qvost/statis" className="contact-large">github.com/qvost/statis ↗</a><a href="https://linkedin.com/in/qvost" className="small">linkedin.com/in/qvost ↗</a></div><a href="mailto:qvostwon@gmail.com" className="contact-large">qvostwon@gmail.com ↗</a></div><div className="htsf-ground"><span className="mono">27.7172° N / 85.3240° E</span><span className="htsf-ground-label">INDEPENDENT SYSTEMS RESEARCH</span><HalftoneField /></div><div className="htsf-bottom"><span>© 2026 QVOST · Siddid Pandey. MIT License.</span><div><PortalLink href="/">statis</PortalLink><a href="/paper/statis_research_paper.pdf">Paper PDF</a><PortalLink href="/benchmarks">Benchmarks</PortalLink><a href="#top" onClick={e => { e.preventDefault(); (document.querySelector('.slp-route-outlet') || window).scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' }); }}>Back to top ↑</a></div></div></footer>; }

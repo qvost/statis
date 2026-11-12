@@ -1,0 +1,298 @@
+{
+  "workloads": {
+    "test_timewarp": {
+      "virtual_seconds": 10,
+      "native": {
+        "status": "ok",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/test_timewarp"
+            ],
+            "status": "ok",
+            "returncode": 0,
+            "elapsed_seconds": 10.001037478,
+            "stdout": "[TimeWarp Target] Starting 10-second nanosleep...\n[TimeWarp Target] Woke up successfully!\n",
+            "stderr": ""
+          }
+        ],
+        "median_seconds": 10.001037478
+      },
+      "statis": {
+        "status": "error",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/statis",
+              "run",
+              "--seed",
+              "42",
+              "--summary=false",
+              "--",
+              "/home/qvost/Projects/statis/target/release/test_timewarp"
+            ],
+            "status": "error",
+            "returncode": 1,
+            "elapsed_seconds": 0.001421208,
+            "stdout": "",
+            "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(870), 1)\n"
+          }
+        ],
+        "median_seconds": null
+      },
+      "speedup": null,
+      "overhead_factor": null,
+      "overhead_percent": null
+    },
+    "test_epoll": {
+      "virtual_seconds": 15,
+      "native": {
+        "status": "ok",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/test_epoll"
+            ],
+            "status": "ok",
+            "returncode": 0,
+            "elapsed_seconds": 15.015707538,
+            "stdout": "[Epoll Target] Calling epoll_wait with 15,000ms timeout...\n[Epoll Target] epoll_wait returned: 0 (expected 0 for timeout)\n",
+            "stderr": ""
+          }
+        ],
+        "median_seconds": 15.015707538
+      },
+      "statis": {
+        "status": "error",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/statis",
+              "run",
+              "--seed",
+              "42",
+              "--summary=false",
+              "--",
+              "/home/qvost/Projects/statis/target/release/test_epoll"
+            ],
+            "status": "error",
+            "returncode": 1,
+            "elapsed_seconds": 0.001335918,
+            "stdout": "",
+            "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(873), 1)\n"
+          }
+        ],
+        "median_seconds": null
+      },
+      "speedup": null,
+      "overhead_factor": null,
+      "overhead_percent": null
+    },
+    "test_concurrency": {
+      "virtual_seconds": null,
+      "native": {
+        "status": "ok",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/test_concurrency"
+            ],
+            "status": "ok",
+            "returncode": 0,
+            "elapsed_seconds": 0.000870364,
+            "stdout": "[Concurrency Target] Lock acquisition order: [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2]\n[Concurrency Target] Final counter: 20\n",
+            "stderr": ""
+          }
+        ],
+        "median_seconds": 0.000870364
+      },
+      "statis": {
+        "status": "error",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/statis",
+              "run",
+              "--seed",
+              "42",
+              "--summary=false",
+              "--",
+              "/home/qvost/Projects/statis/target/release/test_concurrency"
+            ],
+            "status": "error",
+            "returncode": 1,
+            "elapsed_seconds": 0.000947927,
+            "stdout": "",
+            "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(880), 1)\n"
+          }
+        ],
+        "median_seconds": null
+      },
+      "speedup": null,
+      "overhead_factor": null,
+      "overhead_percent": null
+    }
+  },
+  "time_warp_sweep": [
+    {
+      "virtual_seconds": 1,
+      "native_ideal_seconds": 1,
+      "statis": {
+        "status": "skipped",
+        "median_seconds": null,
+        "attempts": [],
+        "reason": "ten-second supervised fixture did not complete"
+      }
+    },
+    {
+      "virtual_seconds": 5,
+      "native_ideal_seconds": 5,
+      "statis": {
+        "status": "skipped",
+        "median_seconds": null,
+        "attempts": [],
+        "reason": "ten-second supervised fixture did not complete"
+      }
+    },
+    {
+      "virtual_seconds": 10,
+      "native_ideal_seconds": 10,
+      "statis": {
+        "status": "error",
+        "requested_samples": 1,
+        "attempts": [
+          {
+            "command": [
+              "/home/qvost/Projects/statis/target/release/statis",
+              "run",
+              "--seed",
+              "42",
+              "--summary=false",
+              "--",
+              "/home/qvost/Projects/statis/target/release/test_timewarp"
+            ],
+            "status": "error",
+            "returncode": 1,
+            "elapsed_seconds": 0.001421208,
+            "stdout": "",
+            "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(870), 1)\n"
+          }
+        ],
+        "median_seconds": null
+      }
+    },
+    {
+      "virtual_seconds": 30,
+      "native_ideal_seconds": 30,
+      "statis": {
+        "status": "skipped",
+        "median_seconds": null,
+        "attempts": [],
+        "reason": "ten-second supervised fixture did not complete"
+      }
+    },
+    {
+      "virtual_seconds": 60,
+      "native_ideal_seconds": 60,
+      "statis": {
+        "status": "skipped",
+        "median_seconds": null,
+        "attempts": [],
+        "reason": "ten-second supervised fixture did not complete"
+      }
+    }
+  ],
+  "trace": {
+    "status": "error",
+    "recording": {
+      "command": [
+        "/home/qvost/Projects/statis/target/release/statis",
+        "record",
+        "--trace",
+        "/tmp/statis-benchmark-z99wz9g8/record_replay.trace",
+        "--seed",
+        "42",
+        "--",
+        "/home/qvost/Projects/statis/target/release/test_record_replay"
+      ],
+      "status": "error",
+      "returncode": 1,
+      "elapsed_seconds": 0.000938032,
+      "stdout": "",
+      "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(882), 1)\n"
+    },
+    "validation": null,
+    "size_bytes": null,
+    "size_kb": null,
+    "size_kib": null,
+    "rr_reference_bytes_per_minute": 45000000,
+    "rr_one_minute_reference_ratio": null,
+    "comparison_note": "Assumed rr rate, not a matched-workload measurement; the short fixture is not a one-minute recording."
+  },
+  "schema_version": 1,
+  "status": "incomplete",
+  "recorded_at_utc": "2026-11-12T02:19:02.834038+00:00",
+  "environment": {
+    "platform": "Linux-7.2.14-arch1-1-x86_64-with-glibc2.44",
+    "machine": "x86_64",
+    "python": "3.14.10",
+    "cpu_count": 16,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "configuration": {
+    "samples": 1,
+    "timeout_seconds": 90,
+    "seed": 42,
+    "build": {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--bins",
+        "--message-format=json"
+      ],
+      "status": "ok",
+      "returncode": 0,
+      "elapsed_seconds": 32.905714285,
+      "stderr": "   Compiling proc-macro2 v1.0.107\n   Compiling quote v1.0.47\n   Compiling unicode-ident v1.0.27\n   Compiling libc v0.2.191\n   Compiling cfg-if v1.0.5\n   Compiling memchr v2.8.3\n   Compiling utf8parse v0.2.2\n   Compiling zerocopy v0.8.63\n   Compiling autocfg v1.5.1\n   Compiling is_terminal_polyfill v1.70.2\n   Compiling colorchoice v1.0.5\n   Compiling anstyle-query v1.1.5\n   Compiling anstyle v1.0.14\n   Compiling regex-syntax v0.8.11\n   Compiling cfg_aliases v0.2.2\n   Compiling heck v0.5.0\n   Compiling nix v0.29.0\n   Compiling log v0.4.35\n   Compiling anstyle-parse v1.0.0\n   Compiling jiff-core v0.1.4\n   Compiling anyhow v1.0.104\n   Compiling strsim v0.11.1\n   Compiling clap_lex v1.1.1\n   Compiling bitflags v2.13.2\n   Compiling anstream v1.0.0\n   Compiling memoffset v0.9.1\n   Compiling clap_builder v4.6.7\n   Compiling aho-corasick v1.1.5\n   Compiling syn v3.0.10\n   Compiling jiff v0.2.42\n   Compiling regex-automata v0.4.18\n   Compiling getrandom v0.2.17\n   Compiling rand_core v0.6.4\n   Compiling clap_derive v4.6.7\n   Compiling bytemuck_derive v1.12.1\n   Compiling regex v1.13.1\n   Compiling env_filter v2.0.0\n   Compiling env_logger v0.11.11\n   Compiling bytemuck v1.25.2\n   Compiling clap v4.6.7\n   Compiling ppv-lite86 v0.2.21\n   Compiling rand_chacha v0.3.1\n   Compiling rand v0.8.8\n   Compiling statis v0.1.0 (/home/qvost/Projects/statis)\n    Finished `release` profile [optimized] target(s) in 32.88s\n"
+    },
+    "binaries_sha256": {
+      "test_timewarp": "8ffe8c57f6e2eeb026f22d413d457201eafe8032678c0f9dd6642cdb8ef9a05a",
+      "test_epoll": "a937c91601fb8b3e7e169db57aba084d983aaae9c2461ba159a6a764d641862a",
+      "test_record_replay": "faa7a1ba7051826cb960b3aa267dd4f2366f157e282c1f192d9bf82bd90b4a61",
+      "test_concurrency": "22d863fd5f5fd78dc2af61eb17501b200a4dcb23f58816346b654aea21b7df17",
+      "statis": "f7f4f6984c43955c8f0c3d220156a4350fde23448ff21aa4bb40329f5628e40f"
+    }
+  },
+  "methodology": [
+    "Sequential fresh processes; perf_counter_ns includes startup, output capture and teardown.",
+    "No warmups; median only when all requested samples exit zero; inspect raw stdout/stderr.",
+    "Native 10s sleep and 15s epoll measured; other native curve points are ideal durations.",
+    "statis pins the target to CPU 0; native execution retains the harness CPU affinity.",
+    "Finite epoll emulation benchmarks timeout completion, not I/O readiness.",
+    "Trace size requires successful recording and trace-dump; partial files are excluded."
+  ]
+}

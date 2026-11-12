@@ -1,0 +1,8 @@
+statis trace v1
+seed: 42
+quantum: 10000
+fault_rate: 0
+command: ["test_record_replay"]
+[100 ns] tid=1000 SYS_clock_gettime(0x1, 0x1000, 0x0, 0x0, 0x0, 0x0) -> 0 (error: 0)
+[150 ns] tid=1000 RDTSC -> 150 cycles
+[150 ns] tid=1000 EXIT -> code 0

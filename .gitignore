@@ -1,1 +1,9 @@
 /target
+__pycache__/
+
+# Independent Next.js research portal
+/portal/node_modules/
+/portal/.next/
+/portal/tsconfig.tsbuildinfo
+/portal/test-results/
+/portal/playwright-report/

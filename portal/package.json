@@ -1,0 +1,46 @@
+{
+  "name": "statis-research-portal",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "scripts": {
+    "predev": "node scripts/sync-assets.mjs",
+    "dev": "next dev --hostname 127.0.0.1",
+    "prebuild": "node scripts/sync-assets.mjs",
+    "build": "next build --webpack",
+    "start": "next start --hostname 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "sync": "node scripts/sync-assets.mjs",
+    "test": "node --test --test-isolation=none tests/*.test.mjs",
+    "test:browser": "node tests/browser.mjs",
+    "verify:stack": "node scripts/check-stack.mjs",
+    "verify": "npm run verify:stack && npm run build && npm run typecheck && npm test && npm run test:browser",
+    "test:oracle": "node scripts/generate-rust-oracle.mjs",
+    "setup:graphics": "npm install --save-exact @vfx-js/core@latest @vfx-js/react@latest @vfx-js/transitions@latest @gsap/react@latest lenis@latest three@latest && npm install --save-dev --save-exact @types/three@latest"
+  },
+  "dependencies": {
+    "@gsap/react": "*",
+    "@vfx-js/core": "*",
+    "@vfx-js/react": "*",
+    "@vfx-js/transitions": "*",
+    "gsap": "3.15.0",
+    "katex": "0.16.47",
+    "lenis": "*",
+    "next": "16.4.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "three": "*"
+  },
+  "devDependencies": {
+    "@types/katex": "0.16.8",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/three": "*",
+    "playwright": "1.64.1",
+    "typescript": "5.9.3"
+  },
+  "type": "module"
+}

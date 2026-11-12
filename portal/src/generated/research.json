@@ -1,0 +1,1563 @@
+{
+  "fixtures": [
+    {
+      "name": "test_target",
+      "path": "tests/test_target.rs",
+      "source": "use std::thread;\n\nfn run_target_thread(id: u8) {\n    let mut random_bytes = [0_u8; 16];\n    // SAFETY: the buffer is writable and exactly 16 bytes long.\n    let random_result =\n        unsafe { libc::getrandom(random_bytes.as_mut_ptr().cast(), random_bytes.len(), 0) };\n    if random_result < 0 {\n        eprintln!(\"[Target Thread {id}] getrandom failed\");\n    } else {\n        let hex: String = random_bytes\n            .iter()\n            .map(|byte| format!(\"{byte:02x}\"))\n            .collect();\n        println!(\"[Target Thread {id}] getrandom: {hex}\");\n    }\n\n    for _ in 0..2 {\n        let mut ts = libc::timespec {\n            tv_sec: 0,\n            tv_nsec: 0,\n        };\n        // SAFETY: `ts` points to valid writable storage.\n        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {\n            println!(\"[Target Thread {id}] time: {}s {}ns\", ts.tv_sec, ts.tv_nsec);\n        } else {\n            eprintln!(\"[Target Thread {id}] clock_gettime failed\");\n        }\n\n        for n in 0_u64..10_000 {\n            std::hint::black_box(n.wrapping_mul(n));\n        }\n    }\n\n    let request = libc::timespec {\n        tv_sec: 0,\n        tv_nsec: 100_000_000,\n    };\n    // SAFETY: `request` is a valid timespec; no remainder is needed here.\n    unsafe {\n        libc::nanosleep(&request, std::ptr::null_mut());\n    }\n}\n\nfn main() {\n    let first = thread::spawn(|| run_target_thread(1));\n    let second = thread::spawn(|| run_target_thread(2));\n    first.join().expect(\"target thread 1 panicked\");\n    second.join().expect(\"target thread 2 panicked\");\n}\n"
+    },
+    {
+      "name": "test_timewarp",
+      "path": "tests/test_timewarp.rs",
+      "source": "fn main() {\n    // Keep the ten-second fixture default; allow the benchmark duration sweep.\n    let seconds = std::env::args()\n        .nth(1)\n        .map(|value| {\n            value\n                .parse::<i64>()\n                .expect(\"duration must be whole seconds\")\n        })\n        .unwrap_or(10);\n    assert!(seconds > 0, \"duration must be positive\");\n    println!(\"[TimeWarp Target] Starting {seconds}-second nanosleep...\");\n\n    let request = libc::timespec {\n        tv_sec: seconds,\n        tv_nsec: 0,\n    };\n    // SAFETY: `request` is a valid timespec and no remainder is needed.\n    let result = unsafe { libc::nanosleep(&request, std::ptr::null_mut()) };\n    if result != 0 {\n        eprintln!(\"[TimeWarp Target] nanosleep failed\");\n        std::process::exit(1);\n    }\n\n    println!(\"[TimeWarp Target] Woke up successfully!\");\n}\n"
+    },
+    {
+      "name": "test_concurrency",
+      "path": "tests/test_concurrency.rs",
+      "source": "use std::sync::{Arc, Mutex};\nuse std::thread;\n\nfn main() {\n    let trace = Arc::new(Mutex::new(Vec::<u32>::new()));\n    let counter = Arc::new(Mutex::new(0_u64));\n    let mut workers = Vec::with_capacity(4);\n\n    for id in 0..4_u32 {\n        let trace = Arc::clone(&trace);\n        let counter = Arc::clone(&counter);\n        workers.push(thread::spawn(move || {\n            for _ in 0..5 {\n                let mut trace = trace.lock().expect(\"trace mutex poisoned\");\n                let mut counter = counter.lock().expect(\"counter mutex poisoned\");\n                trace.push(id);\n                *counter += 1;\n                thread::yield_now();\n            }\n        }));\n    }\n\n    for worker in workers {\n        worker.join().expect(\"worker thread panicked\");\n    }\n\n    let trace = trace.lock().expect(\"trace mutex poisoned\");\n    let counter = counter.lock().expect(\"counter mutex poisoned\");\n    println!(\"[Concurrency Target] Lock acquisition order: {trace:?}\");\n    println!(\"[Concurrency Target] Final counter: {counter}\");\n}\n"
+    },
+    {
+      "name": "test_rdtsc",
+      "path": "tests/test_rdtsc.rs",
+      "source": "fn main() {\n    println!(\"[RDTSC Target] Querying hardware timestamp counter...\");\n\n    // First read using core::arch::x86_64::_rdtsc\n    let t1 = unsafe { core::arch::x86_64::_rdtsc() };\n\n    // Small computation to advance time\n    let mut sum = 0_u64;\n    for i in 1..10_000 {\n        sum = sum.wrapping_add(i * i);\n    }\n    std::hint::black_box(sum);\n\n    // Second read using core::arch::x86_64::__rdtscp\n    let mut aux = 0_u32;\n    let t2 = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };\n\n    println!(\"[RDTSC Target] First read:  {t1}\");\n    println!(\"[RDTSC Target] Second read: {t2}\");\n    println!(\"[RDTSC Target] Synthetic core ID (aux): {aux}\");\n\n    if t2 <= t1 {\n        eprintln!(\"[RDTSC Target] Error: cycle counter did not advance! ({t2} <= {t1})\");\n        std::process::exit(1);\n    }\n\n    println!(\"[RDTSC Target] RDTSC emulation verified successfully!\");\n}\n"
+    },
+    {
+      "name": "test_fault_injection",
+      "path": "tests/test_fault_injection.rs",
+      "source": "use std::os::fd::{AsRawFd, FromRawFd};\n\nfn main() {\n    let mut fds = [-1; 2];\n    // SAFETY: `fds` points to space for two descriptors.\n    if unsafe {\n        libc::socketpair(\n            libc::AF_UNIX,\n            libc::SOCK_STREAM | libc::SOCK_NONBLOCK,\n            0,\n            fds.as_mut_ptr(),\n        )\n    } != 0\n    {\n        eprintln!(\n            \"[Fault Target] socketpair failed: {}\",\n            std::io::Error::last_os_error()\n        );\n        std::process::exit(1);\n    }\n    // SAFETY: socketpair returned two owned descriptors.\n    let left = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };\n    // SAFETY: socketpair returned two owned descriptors.\n    let right = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };\n    let payload = [0x5a_u8; 32];\n    let mut buffer = [0_u8; 64];\n    let mut successes = 0;\n    let mut faults = Vec::new();\n\n    for _ in 0..50 {\n        // SAFETY: payload is readable and the descriptor is valid.\n        let written =\n            unsafe { libc::write(left.as_raw_fd(), payload.as_ptr().cast(), payload.len()) };\n        if written == -1 {\n            faults.push(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));\n        } else {\n            successes += 1;\n        }\n\n        // SAFETY: buffer is writable and the descriptor is valid.\n        let read =\n            unsafe { libc::read(right.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };\n        if read == -1 {\n            faults.push(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));\n        } else {\n            successes += 1;\n        }\n    }\n\n    println!(\n        \"[Fault Target] Operations: 50 | Successes: {successes} | Injected faults: {} (codes: {faults:?})\",\n        faults.len()\n    );\n}\n"
+    },
+    {
+      "name": "test_epoll",
+      "path": "tests/test_epoll.rs",
+      "source": "use std::{\n    io,\n    os::fd::{AsRawFd, FromRawFd, OwnedFd},\n};\n\nfn main() -> io::Result<()> {\n    // SAFETY: epoll_create1 takes only flags and returns a new descriptor.\n    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };\n    if epfd < 0 {\n        return Err(io::Error::last_os_error());\n    }\n    // SAFETY: epfd is a newly created, owned descriptor.\n    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };\n\n    let mut pipefds = [0; 2];\n    // SAFETY: pipefds points to space for both descriptors.\n    if unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {\n        return Err(io::Error::last_os_error());\n    }\n    // SAFETY: pipe2 successfully returned two distinct owned descriptors.\n    let read_fd = unsafe { OwnedFd::from_raw_fd(pipefds[0]) };\n    let _write_fd = unsafe { OwnedFd::from_raw_fd(pipefds[1]) };\n    let mut event = libc::epoll_event {\n        events: libc::EPOLLIN as u32,\n        u64: 0,\n    };\n    // SAFETY: descriptors are valid and event points to an initialized epoll_event.\n    if unsafe {\n        libc::epoll_ctl(\n            epfd.as_raw_fd(),\n            libc::EPOLL_CTL_ADD,\n            read_fd.as_raw_fd(),\n            &mut event,\n        )\n    } < 0\n    {\n        return Err(io::Error::last_os_error());\n    }\n\n    println!(\"[Epoll Target] Calling epoll_wait with 15,000ms timeout...\");\n    // SAFETY: event points to writable storage for one event.\n    let result = unsafe { libc::epoll_wait(epfd.as_raw_fd(), &mut event, 1, 15_000) };\n    println!(\"[Epoll Target] epoll_wait returned: {result} (expected 0 for timeout)\");\n    assert_eq!(result, 0);\n    Ok(())\n}\n"
+    },
+    {
+      "name": "test_record_replay",
+      "path": "tests/test_record_replay.rs",
+      "source": "fn main() {\n    let mut state = 0xcbf2_9ce4_8422_2325_u64;\n    for _ in 0..3 {\n        let mut ts = libc::timespec {\n            tv_sec: 0,\n            tv_nsec: 0,\n        };\n        // SAFETY: ts points to valid writable storage.\n        unsafe {\n            libc::syscall(\n                libc::SYS_clock_gettime,\n                libc::CLOCK_MONOTONIC,\n                &mut ts as *mut libc::timespec,\n            );\n        }\n        state = hash_bytes(state, &ts.tv_sec.to_ne_bytes());\n        state = hash_bytes(state, &ts.tv_nsec.to_ne_bytes());\n\n        let mut random = [0_u8; 16];\n        // SAFETY: random is a valid writable buffer.\n        unsafe {\n            libc::syscall(libc::SYS_getrandom, random.as_mut_ptr(), random.len(), 0);\n        }\n        state = hash_bytes(state, &random);\n\n        let request = libc::timespec {\n            tv_sec: 0,\n            tv_nsec: 1_000_000,\n        };\n        // SAFETY: request points to a valid timespec.\n        unsafe {\n            libc::syscall(\n                libc::SYS_nanosleep,\n                &request as *const libc::timespec,\n                std::ptr::null_mut::<libc::timespec>(),\n            );\n        }\n\n        // SAFETY: rdtsc is available on x86-64.\n        #[cfg(target_arch = \"x86_64\")]\n        let cycles = unsafe { core::arch::x86_64::_rdtsc() };\n        #[cfg(not(target_arch = \"x86_64\"))]\n        let cycles = 0_u64;\n        state = hash_bytes(state, &cycles.to_ne_bytes());\n    }\n    println!(\"[RecordReplay Target] State hash: {state:016x}\");\n}\n\nfn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {\n    for byte in bytes {\n        hash ^= u64::from(*byte);\n        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);\n    }\n    hash\n}\n"
+    },
+    {
+      "name": "test_process_tree",
+      "path": "tests/test_process_tree.rs",
+      "source": "fn verify_process(pid: libc::pid_t, ppid: libc::pid_t) -> bool {\n    // SAFETY: these syscalls take no pointers.\n    unsafe {\n        libc::syscall(libc::SYS_getpid) == pid as libc::c_long\n            && libc::syscall(libc::SYS_getppid) == ppid as libc::c_long\n    }\n}\n\nfn main() {\n    if !verify_process(1000, 999) {\n        eprintln!(\"[ProcessTree] Parent PID/PPID verification failed\");\n        std::process::exit(1);\n    }\n\n    // SAFETY: fork is called before creating any threads.\n    let child1 = unsafe { libc::fork() };\n    if child1 == 0 {\n        if !verify_process(1001, 1000) {\n            // SAFETY: _exit terminates only this forked child.\n            unsafe { libc::_exit(1) };\n        }\n        let mut ts = libc::timespec {\n            tv_sec: 0,\n            tv_nsec: 0,\n        };\n        let mut random = [0_u8; 16];\n        // SAFETY: both pointers refer to valid writable memory.\n        let ok = unsafe {\n            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) == 0\n                && libc::getrandom(random.as_mut_ptr().cast(), random.len(), 0) >= 0\n        };\n        if ok {\n            println!(\"[ProcessTree] Child 1 PID 1001 verified\");\n        }\n        // SAFETY: _exit avoids running copied parent process destructors.\n        unsafe { libc::_exit(if ok { 0 } else { 1 }) };\n    }\n    if child1 < 0 || wait_success(child1) != 0 {\n        std::process::exit(1);\n    }\n\n    // SAFETY: fork is called in the single-threaded parent.\n    let child2 = unsafe { libc::fork() };\n    if child2 == 0 {\n        let verified = verify_process(1002, 1000);\n        std::hint::black_box((0..10_000_u64).fold(0_u64, u64::wrapping_add));\n        // SAFETY: _exit terminates only this forked child.\n        unsafe { libc::_exit(if verified { 0 } else { 1 }) };\n    }\n    if child2 < 0 || wait_success(child2) != 0 {\n        std::process::exit(1);\n    }\n    println!(\"[ProcessTree] All hierarchy tests passed deterministically\");\n}\n\nfn wait_success(pid: libc::pid_t) -> libc::c_int {\n    let mut status = 0;\n    // SAFETY: status is writable and pid is the returned child process ID.\n    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {\n        return -1;\n    }\n    if libc::WIFEXITED(status) {\n        libc::WEXITSTATUS(status)\n    } else {\n        -1\n    }\n}\n"
+    }
+  ],
+  "hashes": {
+    "author-supplied/statis_research_paper.pdf": "1ab09985ce76a028832e20995f4373c0a0af897ca0c10ee450fbfee50f753279",
+    "author-supplied/statis_research_paper.tex": "34a50cd5bcd358e1637bb86494708648cdb4a8544719889cf1d8139583c66999",
+    "benchmarks_svg/time_warp_speedup.svg": "559dc43c36b319726bf298272f2fd3d8cf033f851ba8a330abed3e5d7d4422fc",
+    "benchmarks_svg/trace_size_comparison.svg": "691f307f73457e54f92b858b88895e592f370ccfa97ce8eac69c0cad12ca539b",
+    "benchmarks_svg/determinism_matrix.svg": "d9ed82f345d6d3a9033536c0a5598af60c22315c45074da8901132836d274302",
+    "paper/statis_research_paper.pdf": "1ab09985ce76a028832e20995f4373c0a0af897ca0c10ee450fbfee50f753279",
+    "paper/paper.pdf": "13d02fb69114b04d4c062db595fba9c35041b9dd0694712fccc8f2d8e9873b6f",
+    "paper/paper.tex": "2d9c3d131f1a59e401f02a529b226cb350446a2dfc173fccb25f4388aa66fafc",
+    "docs/benchmark_results.json": "ba65ba6c2eede1ee2fdc0bce2132641d2cc2befdd466b7fa99d7611eba92651a",
+    "docs/benchmarking.md": "4abfcdb3549b11071a498d5c982555d2adb34b52d0de90b28254559bdba10009",
+    "docs/interface.md": "fd500512b0e6a67af5733385efcd2d2fec5d2f0a4df568033a599a27a4d382b7",
+    "README.md": "3d8bb94d9bf59b58d60d2cf8fb383bd6ee6556258e15d48acfd3e77bdd5716c9",
+    "Cargo.toml": "aed75b413101f1d98e558a3a452a66e1734a950be592a974038f87a2d11450c3",
+    "LICENSE": "e9818bcd8cdd097097d121319888cccd4ce686b0b7a698419bdb67aca8c21d97",
+    "src/clock/mod.rs": "a79043b54a486c4b69b2fe9835e50494d94ad62822b901142cf9de073d87ad18",
+    "src/clock/wheel.rs": "587961b25e559dffe38120c2c884784f2f5ccb76b400c55254a75e68bc8a15bc",
+    "src/interceptor/bpf.rs": "182ac43f7bb2327085380f1b8ff345139f56d86d5ac300f5d60b89495084ebcb",
+    "src/interceptor/fault.rs": "54ea7fb2f4f75178457bcd970afd905292f11598e03a563994b15dccb4c947bb",
+    "src/interceptor/mod.rs": "a9596a9b763e171afdbdc1e7618e7c85589e83c81e825787a5c87a002fb6f668",
+    "src/interceptor/notif.rs": "a7a778f8357871febb6ca8307c36c912f777efa2dc12f5482171d7ed229ff349",
+    "src/interceptor/pid.rs": "df7b1c66ca882aebd0cabf293e14c2e3bbc4e0816a4afec1929bae3981e4c357",
+    "src/interceptor/sync.rs": "6f34ec81a5ea42cd6f6630dec3d8cfe075a2cbe8405b9f077c64db3beb8040e3",
+    "src/interceptor/tsc.rs": "88291bb7c4fb295a07548424ff56d4ce613c20c23d81053c045f4bd4277232eb",
+    "src/interceptor/virtual_ids.rs": "28976a110d8064ee3c94e39dd04d76d9a42c7b0d5c93d0d5864ed57890e4aa47",
+    "src/launcher/auxv.rs": "d0c22d4ef51bcc3cb43e454fdb8d5076cb7224cd578acabb7eb12756230bb52c",
+    "src/launcher/fd_pass.rs": "28f96c58e2f9e5bc58d04a15cbae9dfaab79a700db27e9ca28cb3bb91a46ba8c",
+    "src/launcher/mod.rs": "0dec164b5741f69c83cc685a05d706d4b93861729693a0eb0d41c4e9835b9f68",
+    "src/lib.rs": "852df2def965c305e0eef7bab01b8141c2b4cbf7c36cca2cc5e95c4cc8e6b527",
+    "src/main.rs": "35a2619bd2e300f7f8e915fb23247e2ed19f18edfca8c3cce5c00a7f84991eee",
+    "src/scheduler/mod.rs": "7979eb3722b132d0994b49aa3d1b0193a665af03e9e9f821658d0bddfc49e536",
+    "src/scheduler/pmu.rs": "f5a929b625306913c4728ee523e63d699d9d5977908487a0a2cc5fb890715482",
+    "src/supervisor.rs": "52d4dca9642b97e309f15ba56a8c24f8a83e69de5d082e3f6d56456dc5a5e0ce",
+    "src/telemetry.rs": "89a0274907285df26c222b0f122bba73ffa65f7602bc7049a4a206cc55986a75",
+    "src/trace/format.rs": "ca8276336ada95134bd4a9fd35e4066a17447064abf465c5f9c2d650dd4dfb38",
+    "src/trace/mod.rs": "3fd003eefdb50bc57b8868768ea7d0ff23d371ec36d84a3ada17309986a96391",
+    "src/vm.rs": "91f151bc3d1a5d4b737d657b78f3a2e25baaca823f2d77bf4358922593575ffb",
+    "tests/test_concurrency.rs": "a859f1cba3eaef834a7c6af6fda4f8592e318888ef6ab2c87074919846a12f07",
+    "tests/test_epoll.rs": "7c624c87eb32eddf0eb16eeb81d687417817218bddc492d7522d3a4ac7fc116a",
+    "tests/test_fault_injection.rs": "770d7875d59ace1c691db99bbb56924c0431997c42fa120dcc062bfc8d93af10",
+    "tests/test_process_tree.rs": "03ebaea2f0ca9b23819feb46103ef65a521c11de3df32cbcdbe24aee0bc089b3",
+    "tests/test_rdtsc.rs": "5cc56893102082251aad1f6edd5a4b0573c715ca0b69c71acc4fa59de77d0a1b",
+    "tests/test_record_replay.rs": "402cf508e945336f87af7cacf36d00d8c286d51cf3aafbba7147b60cb8356fc3",
+    "tests/test_target.rs": "029ba28b3d4402ed71619d2174161acc5df029e824cd4e71d589d0839b7ed0fb",
+    "tests/test_timewarp.rs": "9bc696d06b22823dcc3023c3cf8faafde028953764e243c0fc016369363ab9b6"
+  },
+  "paper": {
+    "title": "Statis: High-Performance Seed-Deterministic Userspace Supervision for Unmodified Linux Binaries",
+    "author": "Siddid Pandey",
+    "pages": 7,
+    "blocks": [
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Abstract"
+      },
+      {
+        "type": "paragraph",
+        "text": "A Linux process is nondeterministic for reasons that have nothing to do with its own logic: it reads a clock, executes rdtsc, sleeps, races its threads, and receives whatever errors the network chooses to deliver. Existing tools either record everything that happened (and store gigabytes to replay it) or rebuild a deterministic container around the program. We ask whether a single userspace supervisor, with no kernel module and no recompilation, can make an unmodified binary a pure function of one integer seed. We introduce Statis, a supervisor that takes control of every source of nondeterminism a program can observe. It blinds the vDSO by rewriting AT_SYSINFO_EHDR to AT_IGNORE in the ELF auxiliary vector at every execve, so libc must issue real, interceptable system calls. It emulates rdtsc/rdtscp through PR_TSC_SIGSEGV and a virtual clock. It replaces wall-clock waiting with a min-heap time wheel, so an idle process tree warps past nanosleep, clock_nanosleep, epoll_wait and poll: a 10 s sleep completes in 18 ms and a 15 s epoll_wait in 17 ms, over 500$\\times$ faster than wall clock. A userspace futex manager and PMU-driven instruction quanta make multithreaded schedules a function of the seed; a ChaCha20 stream derived from the same seed injects reproducible system-call errors. Replay needs only a compact, little-endian trace of kilobytes (versus gigabytes for rr), checked by semantic argument matching so that stack-pointer shifts do not raise false divergences. Statis is open source."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Introduction"
+      },
+      {
+        "type": "paragraph",
+        "text": "Debugging a distributed system, a flaky test, or a concurrency bug is hard because the failing execution cannot be summoned on demand. The program is not the only author of its behavior. The kernel contributes the time of day, the interleaving of threads, the readiness of file descriptors, and the occasional ECONNRESET; the CPU contributes a cycle counter that any unprivileged instruction can read. Two runs of the same binary on the same input diverge, and the bug disappears under the debugger."
+      },
+      {
+        "type": "paragraph",
+        "text": "Two families of tools attack this. Record-and-replay systems such as rr [rr] log every nondeterministic input of one run and re-execute it faithfully; the price is a recording that grows with the program's activity and a dependence on hardware performance counters. Deterministic containers such as DetTrace [dettrace] and Hermit [hermit] instead rebuild the execution environment so that nondeterminism is removed (or controlled by a seed) at the source, with no recording needed. Our work sits in the second family, and asks how little machinery that takes."
+      },
+      {
+        "type": "paragraph",
+        "text": "We observe that, on Linux/x86-64, every observable source of nondeterminism crosses one of four boundaries: a system call, a trapped instruction, a thread-scheduling decision, or the ELF auxiliary vector that tells libc where fast paths live. A supervisor that owns all four can turn the program into a deterministic function of a seed, without touching the kernel or the binary. Statis is that supervisor."
+      },
+      {
+        "type": "figure",
+        "kind": "supplied-architecture",
+        "caption": "Statis architecture. The child's system calls reach the supervisor's dispatcher through a seccomp user-notification listener (IPC); the dispatcher consults the virtual clock, futex manager, fault injector and virtual PID table before replying. Exec stops and rdtsc faults arrive through ptrace, PMU overflows delimit scheduling quanta, and the kernel's silent thread-exit wake is surfaced to the futex manager.",
+        "plots": [],
+        "source": "\\centering\n\\begin{tikzpicture}[font=\\footnotesize,\n  box/.style={draw,rounded corners=2pt,align=center,minimum height=7.5mm,minimum width=2.6cm,inner sep=2pt,fill=white},\n  frame/.style={draw,rounded corners=4pt,thick},\n  arr/.style={-{Stealth[length=2mm]},thick},\n  darr/.style={{Stealth[length=2mm]}-{Stealth[length=2mm]},thick},\n  lab/.style={font=\\scriptsize\\itshape,inner sep=1pt}]\n% supervisor\n\\draw[frame,fill=supc] (0,0) rectangle (9.4,5.6);\n\\node[font=\\small\\bfseries,anchor=north west] at (0.1,5.55) {Supervisor (single userspace process)};\n\\node[box] (sched) at (1.65,4.2) {Deterministic\\\\scheduler};\n\\node[box] (clock) at (4.7,4.2) {Virtual clock\\\\+ time wheel};\n\\node[box] (futex) at (7.75,4.2) {\\texttt{FutexManager}};\n\\node[box] (fault) at (1.65,2.6) {ChaCha20\\\\fault injector};\n\\node[box] (vpid)  at (4.7,2.6) {Virtual PID\\\\table};\n\\node[box] (trace) at (7.75,2.6) {Trace writer /\\\\replay checker};\n\\node[box,minimum width=8.4cm] (disp) at (4.7,0.8) {Syscall dispatcher (seccomp notification loop)};\n\\draw[arr] (sched)--(clock); \\draw[arr] (clock)--(futex);\n\\foreach \\n in {fault,vpid,trace}{\\draw[arr] (disp.north -| \\n.south) -- (\\n.south);}\n% child\n\\draw[frame,fill=chic] (11.2,0) rectangle (16.8,5.6);\n\\node[font=\\small\\bfseries,anchor=north west] at (11.3,5.55) {Child tree (unmodified ELF)};\n\\node[box,minimum width=4.2cm] (app) at (14.0,4.3) {Application + libc};\n\\node[box,minimum width=4.2cm] (aux) at (14.0,2.6) {auxv without vDSO\\\\(real syscalls only)};\n\\node[box,minimum width=4.2cm] (sc)  at (14.0,0.8) {\\texttt{syscall} / trapped \\texttt{rdtsc}};\n\\draw[arr] (app)--(aux); \\draw[arr] (aux)--(sc);\n\\draw[arr] ([yshift=2mm]sc.west) -- node[lab,above] {notification} ([yshift=2mm]disp.east -| 9.4,0) -- ([yshift=2mm]disp.east);\n\\draw[arr,dashed,color=accent] ([yshift=-2mm]disp.east) -- node[lab,below] {reply} ([yshift=-2mm]sc.west);\n% kernel\n\\draw[frame,fill=kerc] (0,-2.5) rectangle (16.8,-1.0);\n\\node[font=\\small\\bfseries,anchor=north west] at (0.1,-1.03) {Linux kernel};\n\\node[box,minimum width=2.15cm,font=\\scriptsize] (k1) at (1.3,-1.95) {seccomp\\\\\\texttt{USER\\_NOTIF}};\n\\node[box,minimum width=2.15cm,font=\\scriptsize] (k2) at (3.7,-1.95) {\\texttt{ptrace},\\\\\\texttt{PR\\_TSC\\_SIGSEGV}};\n\\node[box,minimum width=2.15cm,font=\\scriptsize] (k3) at (6.1,-1.95) {PMU\\\\\\texttt{perf\\_event\\_open}};\n\\node[box,minimum width=2.15cm,font=\\scriptsize] (k4) at (8.5,-1.95) {\\texttt{CLONE\\_CHILD}\\\\\\texttt{\\_CLEARTID} wake};\n\\node[box,minimum width=4.2cm,font=\\scriptsize] (k5) at (14.0,-1.95) {syscall entry, \\texttt{rdtsc} fault};\n\\draw[darr] (k1.north) -- (k1.north |- 0,0) node[lab,midway,right] {};\n\\draw[darr] (k2.north) -- (k2.north |- 0,0);\n\\draw[arr] (k3.north) -- (k3.north |- 0,0);\n\\draw[arr] (k4.north) -- (k4.north |- 0,0);\n\\draw[darr] (k5.north) -- (k5.north |- 0,0);\n\\node[lab,anchor=west] at (1.4,-0.45) {notify / reply};\n\\node[lab,anchor=west] at (3.8,-0.45) {exec, \\texttt{SIGSEGV}};\n\\node[lab,anchor=west] at (6.2,-0.45) {quantum end};\n\\node[lab,anchor=west] at (8.6,-0.45) {thread exit};\n\\node[lab,anchor=west] at (14.1,-0.55) {traps};\n\\end{tikzpicture}\n\\caption{\\statis{} architecture. The child's system calls reach the supervisor's dispatcher through a seccomp user-notification listener (IPC); the dispatcher consults the virtual clock, futex manager, fault injector and virtual PID table before replying. Exec stops and \\texttt{rdtsc} faults arrive through \\texttt{ptrace}, PMU overflows delimit scheduling quanta, and the kernel's silent thread-exit wake is surfaced to the futex manager.}\n\\label{fig:arch}",
+        "supplied": true
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Contributions."
+      },
+      {
+        "type": "list",
+        "ordered": false,
+        "items": [
+          "vDSO neutralization. Rewriting AT_SYSINFO_EHDR (type 33) to AT_IGNORE (type 1) in the auxiliary vector at every execve, forcing libc to issue real syscalls across exec boundaries (§[sec:vdso]).",
+          "Hardware-clock emulation and time warping. rdtsc/rdtscp are virtualized through PR_TSC_SIGSEGV, and a monotonic virtual clock with a min-heap time wheel lets idle process trees skip waiting, 10 s in 18 ms (§[sec:tsc]–§[sec:warp]).",
+          "Seed-derived concurrency and faults. A userspace futex manager, silent-exit detection for pthread_join, PMU instruction quanta, and ChaCha20 error injection make threads and failures functions of one seed (§[sec:conc]–§[sec:fault]).",
+          "Compact trace, semantic replay. Kilobyte-scale little-endian traces verified by semantic argument matching (§[sec:trace]).",
+          "Honest evaluation. We state which numbers are measured and which are still pending."
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Design"
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Overview and determinism contract"
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis launches the target as a child, installs a seccomp filter in it that returns SECCOMP_RET_USER_NOTIF for the system calls it wants to mediate, and receives the notification file descriptor over a Unix socket (SCM_RIGHTS). The supervisor then serves a single dispatch loop (Figure [fig:arch]). Calls the supervisor does not need to change are allowed through to the kernel; the rest are answered from supervisor state."
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Contract."
+      },
+      {
+        "type": "paragraph",
+        "text": "Let $B$ be a binary, $I$ its input (arguments, environment, files), and $s$ a 64-bit seed. Statis aims for the following property:"
+      },
+      {
+        "type": "math",
+        "text": "\\mathrm{Run}(B, I, s) = \\mathrm{Run}(B, I, s)\\quad\\text{for every run,}"
+      },
+      {
+        "type": "paragraph",
+        "text": "where $\\mathrm{Run}$ denotes the sequence of observable events (system calls with semantic arguments and results, and trapped-instruction results). The contract holds under a closed-world assumption: the only nondeterminism is what Statis virtualizes. Inputs from outside the supervised tree (live remote peers, other host processes) are outside the contract (§[sec:limits])."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "vDSO neutralization"
+      },
+      {
+        "type": "paragraph",
+        "text": "On x86-64, libc resolves clock_gettime, gettimeofday, time and getcpu to code in the vDSO, a kernel-provided shared object that reads time from shared memory without entering the kernel [vdso]. Such calls are invisible to seccomp and ptrace, so no supervisor can see or control them. The kernel announces the vDSO's address in the auxiliary vector under the key AT_SYSINFO_EHDR (33); if the entry is absent, libc falls back to ordinary system calls."
+      },
+      {
+        "type": "algorithm",
+        "caption": "Auxiliary-vector scrubbing at execve",
+        "source": "\\caption{Auxiliary-vector scrubbing at \\sys{execve}}\n\\label{alg:auxv}\n\\KwIn{tracee $p$ stopped at \\sys{PTRACE_EVENT_EXEC}}\n$sp \\gets \\textsc{GetReg}(p,\\texttt{rsp})$\\;\n$argc \\gets \\textsc{Peek}(p, sp)$\\;\n$sp \\gets sp + 8\\,(argc{+}2)$ \\Comment*[r]{past argc, argv, NULL}\n\\While{$\\textsc{Peek}(p, sp) \\neq 0$}{$sp \\gets sp + 8$ \\Comment*[r]{envp}}\n$sp \\gets sp + 8$ \\Comment*[r]{past envp NULL}\n$t \\gets \\textsc{Peek}(p, sp)$\\;\n\\While{$t \\neq 0$}{\n  \\If{$t = 33$}{$\\textsc{Poke}(p, sp, 1)$ \\Comment*[r]{AT\\_IGNORE}}\n  $sp \\gets sp + 16$;\\quad $t \\gets \\textsc{Peek}(p, sp)$\\;\n}\n$\\textsc{Resume}(p)$\\;"
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis therefore inspects the new process's initial stack at every execve stop and overwrites the type word of the AT_SYSINFO_EHDR entry with AT_IGNORE (Algorithm [alg:auxv], Figure [fig:auxv]). The value word is left in place; libc ignores an AT_IGNORE entry entirely and never maps a vDSO. Because the rewrite is repeated on every exec, a shell script that spawns a pipeline of programs stays blinded throughout the tree; an interposer that only patched the first process would lose control at the first exec."
+      },
+      {
+        "type": "figure",
+        "kind": "auxv",
+        "caption": "Auxiliary-vector scrubbing. Left: the per-exec procedure. Right: the entry for the vDSO has its key changed from 33 to 1; its value is untouched. The same transformation runs at every execve in the process tree.",
+        "plots": [],
+        "source": "\\centering\n\\begin{tikzpicture}[font=\\footnotesize,\n  node distance=5mm,\n  stp/.style={draw,rounded corners=2pt,align=center,fill=supc,minimum height=7mm,text width=4.6cm,inner sep=3pt},\n  dec/.style={draw,diamond,aspect=2.6,align=center,fill=chic,inner sep=1pt},\n  arr/.style={-{Stealth[length=2mm]},thick},\n  cell/.style={draw,minimum width=3.1cm,minimum height=6mm,inner sep=1pt,font=\\scriptsize\\ttfamily}]\n% flowchart\n\\node[stp] (a) {\\texttt{execve} completes; tracee stops at \\texttt{PTRACE\\_EVENT\\_EXEC}};\n\\node[stp,below=of a] (b) {Read \\texttt{rsp}; skip \\texttt{argc}, \\texttt{argv}, \\texttt{envp}};\n\\node[stp,below=of b] (c) {Walk auxv $(\\text{type},\\text{value})$ pairs};\n\\node[dec,below=6mm of c] (d) {type $=33$?};\n\\node[stp,right=18mm of d,fill=warn!15] (e) {Overwrite type word\\\\with \\texttt{AT\\_IGNORE} (1)};\n\\node[stp,below=7mm of d] (f) {Resume tracee; libc finds no vDSO};\n\\node[stp,below=of f,fill=accent!12] (g) {\\texttt{clock\\_gettime}, \\texttt{time}, \\dots{} become real syscalls $\\Rightarrow$ seccomp-trapped};\n\\draw[arr] (a)--(b); \\draw[arr] (b)--(c); \\draw[arr] (c)--(d);\n\\draw[arr] (d)--node[above,font=\\scriptsize]{yes}(e);\n\\draw[arr] (d)--node[right,font=\\scriptsize]{no (next pair)}(f);\n\\draw[arr] (e) |- (f);\n\\draw[arr] (f)--(g);\n% stack before / after\n\\node[font=\\scriptsize\\bfseries] at (9.5,0.1) {Initial stack (before)};\n\\foreach \\i/\\t/\\v in {0/AT\\_PAGESZ/4096, 1/AT\\_SYSINFO\\_EHDR/0x7ffc\\ldots, 2/AT\\_HWCAP/0x178b\\ldots, 3/AT\\_NULL/0}{\n  \\node[cell,fill=white] at (9.5,-0.65-\\i*0.6) {\\t};\n  \\node[cell,fill=white,minimum width=2.4cm,anchor=west] at (11.05,-0.65-\\i*0.6) {\\v};}\n\\node[cell,fill=warn!25] at (9.5,-1.25) {AT\\_SYSINFO\\_EHDR};\n\\node[font=\\scriptsize\\bfseries] at (9.5,-3.4) {Initial stack (after)};\n\\foreach \\i/\\t/\\v in {0/AT\\_PAGESZ/4096, 1/AT\\_IGNORE/0x7ffc\\ldots, 2/AT\\_HWCAP/0x178b\\ldots, 3/AT\\_NULL/0}{\n  \\node[cell,fill=white] at (9.5,-3.95-\\i*0.6) {\\t};\n  \\node[cell,fill=white,minimum width=2.4cm,anchor=west] at (11.05,-3.95-\\i*0.6) {\\v};}\n\\node[cell,fill=warn!25] at (9.5,-4.55) {AT\\_IGNORE};\n\\node[font=\\scriptsize] at (14.3,-1.25) {$\\leftarrow$ type 33};\n\\node[font=\\scriptsize] at (14.3,-4.55) {$\\leftarrow$ type 1};\n\\end{tikzpicture}\n\\caption{Auxiliary-vector scrubbing. Left: the per-\\texttt{exec} procedure. Right: the entry for the vDSO has its key changed from 33 to 1; its value is untouched. The same transformation runs at every \\texttt{execve} in the process tree.}\n\\label{fig:auxv}",
+        "supplied": true
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Hardware RDTSC emulation"
+      },
+      {
+        "type": "paragraph",
+        "text": "Even with the vDSO gone, rdtsc is an unprivileged instruction that reads the cycle counter directly and generates no system call. Linux can make it fault: prctl(PR_SET_TSC, PR_TSC_SIGSEGV) causes the instruction to raise SIGSEGV in the calling thread [prctl]. The child enables this before its first instruction; the supervisor, which is the tracer, receives the signal as a signal-delivery stop and does the following."
+      },
+      {
+        "type": "list",
+        "ordered": true,
+        "items": [
+          "Read the instruction at RIP. Opcode 0F 31 is rdtsc; 0F 01 F9 is rdtscp. Any other faulting instruction is a genuine crash and is delivered to the program unchanged.",
+          "Compute the virtual counter $\\tau$ from the virtual clock $V$ (in ns) and a nominal frequency $f$ (Hz):\n$$\n\\tau(V)=\\Big\\lfloor \\frac{V\\cdot f}{10^{9}}\\Big\\rfloor,\\quad\n\\mathtt{RAX}=\\tau \\bmod 2^{32},\\ \\mathtt{RDX}=\\tau\\gg 32 .\n\n$$",
+          "For rdtscp, also set RCX to a virtual core identifier $\\pi(\\text{tid})$, a deterministic function of the thread, so rdtscp-based CPU identification is stable.",
+          "Advance RIP by the instruction length (2 or 3 bytes), suppress the signal, and resume."
+        ]
+      },
+      {
+        "type": "paragraph",
+        "text": "Since $\\tau$ depends only on $V$, a program that busy-waits on rdtsc sees time advance only through the virtual clock's own rules (§[sec:warp]); it observes neither the host's cycle count nor the speed of the machine."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Virtual clock and instant time-warping"
+      },
+      {
+        "type": "paragraph",
+        "text": "The virtual clock $V\\in\\mathbb{N}$ (ns) is monotonic and owned by the supervisor. It advances in two ways: by a fixed cost $c_{\\text{sys}}$ per mediated system call, and by $\\alpha\\,\\Delta I$ for each scheduling quantum in which the tracee retired $\\Delta I$ instructions (§[sec:conc]). Both are functions of the program's own execution, not of host speed."
+      },
+      {
+        "type": "paragraph",
+        "text": "Timed waits do not block. When a thread issues nanosleep, clock_nanosleep, epoll_wait or poll with a finite timeout, the supervisor computes the absolute deadline $d=V+\\text{timeout}$, inserts the waiter into a min-heap time wheel $W$ keyed by $d$, and does not reply to the seccomp notification. Let $R$ be the set of runnable threads. If $R=\\emptyset$ the whole tree is idle, and the clock jumps:"
+      },
+      {
+        "type": "math",
+        "text": "\\operatorname{warp}:\\quad R=\\emptyset\\ \\Longrightarrow\\ V \\leftarrow \\max\\Big(V,\\ \\min_{w\\in W} d_w\\Big),"
+      },
+      {
+        "type": "paragraph",
+        "text": "after which the earliest waiter is released (a sleep returns $0$; an epoll_wait with no ready descriptor returns $0$ events). Equation [eq:warp] never moves the clock backwards, and it jumps only when nothing can make progress, so the order of all events is the same as in a real-time run; only the idle gaps are removed."
+      },
+      {
+        "type": "algorithm",
+        "caption": "Dispatch loop with time warping",
+        "source": "\\caption{Dispatch loop with time warping}\n\\label{alg:warp}\n\\While{tree not exited}{\n  \\If{$R \\neq \\emptyset$}{\n    $t \\gets \\textsc{PickNext}(R)$ \\Comment*[r]{seeded, deterministic order}\n    run $t$ for one quantum; $V \\mathrel{+}= \\alpha\\,\\Delta I$\\;\n    \\textsc{Handle}(syscall or trap of $t$)\\;\n  }\n  \\ElseIf{$W \\neq \\emptyset$}{\n    $w \\gets \\textsc{PopMin}(W)$;\\quad $V \\gets \\max(V, d_w)$\\;\n    \\textsc{Release}($w$, result $=0$)\\;\n  }\n  \\Else{ \\textsc{ReportDeadlock}() }\n}"
+      },
+      {
+        "type": "paragraph",
+        "text": "The speedup for a sleeping workload of nominal duration $D$ whose supervised wall time is $\\varepsilon$ is $S=D/\\varepsilon$. For a 10 s sleep completing in 18 ms, $S\\approx 556\\times$; for a 15 s epoll_wait completing in 17 ms, $S\\approx 882\\times$ (§[sec:eval]). The remaining wall time is supervisor overhead (process creation, seccomp installation, dispatch), not waiting."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Concurrency, futexes and preemption"
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "FutexManager."
+      },
+      {
+        "type": "paragraph",
+        "text": "Threads block on futex(FUTEX_WAIT) and are released by FUTEX_WAKE. If these were left to the kernel, wake order would depend on kernel internals. Statis instead intercepts them: a userspace FutexManager keeps a FIFO wait queue per futex address, parks a waiter by withholding its notification reply, and answers a wake by releasing queued waiters in a fixed order. Futex traffic thus becomes part of the deterministic event stream [futex]."
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Silent thread exit."
+      },
+      {
+        "type": "paragraph",
+        "text": "pthread_join waits on the thread's TID word, which the kernel clears and wakes by itself when a thread created with CLONE_CHILD_CLEARTID exits. No system call is made by anyone, so the supervisor would never learn the waiter should wake. Statis records each thread's ctid address at clone, observes thread exit through its ptrace exit event, and wakes the FutexManager queue for that address itself, restoring a join that would otherwise hang or return in kernel-dependent order."
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "PMU quanta."
+      },
+      {
+        "type": "paragraph",
+        "text": "A thread that never calls into the kernel (a spin loop) would starve the others. Statis opens a per-thread perf_event_open counter of user-mode retired instructions with sample period $Q$; overflow ends the quantum, and the scheduler picks the next runnable thread. The quantum is measured in instructions, not time, so the interleaving is independent of host load, and the seed selects the order in which runnable threads are visited."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Deterministic fault injection"
+      },
+      {
+        "type": "paragraph",
+        "text": "Reproducing a failure requires failures that are themselves reproducible. Let $k=\\mathrm{KDF}(s)$ be a 256-bit key derived from the seed and $n$ the index of the current mediated system call in the deterministic event order. Statis draws a word from ChaCha20 [chacha]:"
+      },
+      {
+        "type": "math",
+        "text": "u_n=\\frac{\\mathrm{ChaCha20}_{k}(n)}{2^{32}},\\qquad\n\\text{inject}\\iff u_n<p_c\\ \\wedge\\ \\text{fd}>2,"
+      },
+      {
+        "type": "paragraph",
+        "text": "where $p_c$ is the configured probability for the call's class $c$. The error is selected from a class-specific set using a second word of the same stream: network operations draw from \\-ECONNRESET, -ETIMEDOUT\\, nonblocking I/O from \\-EAGAIN\\, and blocking calls may also see -EINTR or -EIO. File descriptors $\\le 2$ (stdin, stdout, stderr) are protected: errors injected there would corrupt the program's output channel and the supervisor's own diagnostics rather than test its logic. Because $n$ is a position in a deterministic order, the same seed reproduces the same failure at the same call."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Process hierarchy and virtual PIDs"
+      },
+      {
+        "type": "paragraph",
+        "text": "Real PIDs vary from run to run, so a program that prints or hashes its PID is nondeterministic. Statis presents a synthetic hierarchy: getpid returns 1000, getppid returns 999, and gettid returns a stable per-thread virtual identifier assigned in creation order. Signals are the inverse problem: SYS_kill and SYS_tgkill carry virtual identifiers, which the supervisor maps to the corresponding real OS PIDs before performing the call, so a program signalling its ``parent'' or a sibling reaches the right target."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Compact trace and semantic replay"
+      },
+      {
+        "type": "paragraph",
+        "text": "Because the seed determines the schedule, time, and faults, Statis does not need to store inputs to reproduce a run; the trace's role is to verify that a re-execution has not diverged, and to support debugging. The trace is a little-endian binary stream: a header (magic, version, seed, configuration) followed by one fixed-layout record per mediated event holding thread id, syscall number, a small vector of semantic argument digests, and the result. Its size grows with the number of events, not with the bytes the program moves, and so is measured in kilobytes where rr recordings, which capture memory and I/O contents, reach gigabytes [rr]."
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Semantic matching."
+      },
+      {
+        "type": "paragraph",
+        "text": "Raw argument words are not stable across runs even when behavior is: a different environment size or ASLR slide shifts stack pointers, so a pointer to a buffer in a read has a different value each run. Comparing raw words would flag a divergence on every event. Replay therefore compares a normalized form: file descriptors and flags by value, lengths by value, string arguments (paths) by content, and pointer arguments are ignored. Two events match iff"
+      },
+      {
+        "type": "math",
+        "text": "(\\text{tid},\\ \\text{nr},\\ \\sigma(\\mathbf{a}),\\ \\text{ret})=(\\text{tid}',\\ \\text{nr}',\\ \\sigma(\\mathbf{a}'),\\ \\text{ret}'),"
+      },
+      {
+        "type": "paragraph",
+        "text": "where $\\sigma$ projects the argument vector to its semantic components. The first mismatch is reported with its event index."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Implementation"
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis targets Linux on x86-64, because PR_SET_TSC and the rdtsc decoding are x86-specific. It requires no kernel module or root privilege beyond what ptrace, seccomp user notification (seccomp_unotify [unotify]) and perf_event_open [perf] need. The supervisor is a single process: a ptrace event loop plus the notification loop. Dispatch is table-driven by syscall number, and each mediated class (time, sleep/poll, futex, identity, signal, I/O) has its own handler. Handlers that must act on the tracee's memory (strings for the trace, timespec arguments) read it from the tracee's address space. [PENDING: source line counts, language, build and dependency footprint from the repository]"
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Evaluation"
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Setup."
+      },
+      {
+        "type": "paragraph",
+        "text": "[PENDING: host CPU, kernel version, virtualization, PMU availability, number of runs, how wall time is measured.] All time-warp numbers below are wall-clock times of the supervised process tree, from launch to exit."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Comparison with related systems"
+      },
+      {
+        "type": "paragraph",
+        "text": "Table [tab:compare] compares Statis with native Linux and the three systems closest in goal. Entries for other systems follow their public documentation and papers; we mark those that deserve checking against current releases."
+      },
+      {
+        "type": "table",
+        "caption": "Competitive comparison. $\\dagger$: from public documentation; behaviour may differ across versions. ``Seed'' means a user-chosen integer selects the schedule.",
+        "rows": [
+          [
+            "",
+            "Native Linux",
+            "Mozilla rr [rr]",
+            "Meta Hermit [hermit]",
+            "DetTrace [dettrace]",
+            "Statis"
+          ],
+          [
+            "Runs unmodified binaries",
+            "✓",
+            "✓",
+            "✓",
+            "✓",
+            "✓"
+          ],
+          [
+            "No kernel changes",
+            "✓",
+            "✓",
+            "✓$^\\dagger$",
+            "✓$^\\dagger$",
+            "✓"
+          ],
+          [
+            "Deterministic re-execution",
+            "×",
+            "replay of a recording",
+            "✓",
+            "✓",
+            "✓ (seed)"
+          ],
+          [
+            "Seeded schedule exploration",
+            "×",
+            "chaos mode$^\\dagger$",
+            "✓$^\\dagger$",
+            "×$^\\dagger$",
+            "✓"
+          ],
+          [
+            "Idle-wait time warp (sleep/poll/epoll)",
+            "×",
+            "×",
+            "partial$^\\dagger$",
+            "×$^\\dagger$",
+            "✓"
+          ],
+          [
+            "Seeded syscall error injection",
+            "×",
+            "×",
+            "×$^\\dagger$",
+            "×$^\\dagger$",
+            "✓"
+          ],
+          [
+            "Replay artifact",
+            "none",
+            "full recording (GB)",
+            "seed$^\\dagger$",
+            "re-execution$^\\dagger$",
+            "seed + trace (KB)"
+          ]
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Time warping"
+      },
+      {
+        "type": "paragraph",
+        "text": "Figure [fig:warp] shows the headline result. A process that sleeps for 10 s completes in 18 ms under Statis, and one that blocks 15 s in epoll_wait with no ready descriptor completes in 17 ms: speedups of roughly $556\\times$ and $882\\times$, both above the $500\\times$ mark. A test suite dominated by timeouts, retries and heartbeats can therefore be run in a small fraction of its nominal duration while seeing the same event order."
+      },
+      {
+        "type": "figure",
+        "kind": "timewarp",
+        "caption": "Time-warp speedup (log scale). Statis completes a 10 s sleep in 18 ms ($\\approx$556$\\times$) and a 15 s epoll_wait in 17 ms ($\\approx$882$\\times$). Native values are the nominal durations.",
+        "plots": [
+          [
+            [
+              "sleep 10 s",
+              10000
+            ],
+            [
+              "epoll_wait 15 s",
+              15000
+            ]
+          ],
+          [
+            [
+              "sleep 10 s",
+              18
+            ],
+            [
+              "epoll_wait 15 s",
+              17
+            ]
+          ]
+        ],
+        "source": "\\centering\n\\begin{tikzpicture}\n\\begin{axis}[\n  ybar, bar width=14pt,\n  width=\\columnwidth, height=5.4cm,\n  ymode=log, ymin=1, ymax=60000,\n  ylabel={wall time (ms, log)},\n  symbolic x coords={sleep 10\\,s, epoll\\_wait 15\\,s},\n  xtick=data, enlarge x limits=0.45,\n  legend style={at={(0.5,1.04)},anchor=south,legend columns=2,font=\\footnotesize,draw=none},\n  nodes near coords, point meta=explicit symbolic,\n  every node near coord/.append style={font=\\scriptsize},\n  tick label style={font=\\footnotesize}, label style={font=\\footnotesize},\n  ymajorgrids, grid style={dotted,gray!60}]\n\\addplot[fill=gray!55,draw=black] coordinates {(sleep 10\\,s,10000) [10{,}000\\,ms] (epoll\\_wait 15\\,s,15000) [15{,}000\\,ms]};\n\\addplot[fill=accent,draw=black] coordinates {(sleep 10\\,s,18) [18\\,ms] (epoll\\_wait 15\\,s,17) [17\\,ms]};\n\\legend{native Linux (nominal), \\statis{}}\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Time-warp speedup (log scale). \\statis{} completes a 10\\,s sleep in 18\\,ms ($\\approx$556$\\times$) and a 15\\,s \\texttt{epoll\\_wait} in 17\\,ms ($\\approx$882$\\times$). Native values are the nominal durations.}\n\\label{fig:warp}",
+        "supplied": true
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Trace storage"
+      },
+      {
+        "type": "paragraph",
+        "text": "Figure [fig:trace] contrasts the artifact needed to replay a run. rr stores a recording that includes the contents of nondeterministic inputs and grows to gigabytes; Statis stores only event records, in kilobytes, because the seed regenerates the rest."
+      },
+      {
+        "type": "figure",
+        "kind": "storage",
+        "caption": "Trace storage, rr vs.\\ Statis. [PENDING: plotted values are layout placeholders at the stated orders of magnitude (GB vs.\\ KB); replace with measured sizes for named workloads W1–W3].",
+        "plots": [
+          [
+            [
+              "W1",
+              1000000000
+            ],
+            [
+              "W2",
+              2000000000
+            ],
+            [
+              "W3",
+              4000000000
+            ]
+          ],
+          [
+            [
+              "W1",
+              20000
+            ],
+            [
+              "W2",
+              40000
+            ],
+            [
+              "W3",
+              80000
+            ]
+          ]
+        ],
+        "source": "\\centering\n\\begin{tikzpicture}\n\\begin{axis}[\n  ybar, bar width=12pt,\n  width=\\columnwidth, height=5.4cm,\n  ymode=log, ymin=1e3, ymax=1e11,\n  ylabel={trace size (bytes, log)},\n  symbolic x coords={W1,W2,W3},\n  xtick=data, enlarge x limits=0.3,\n  legend style={at={(0.5,1.04)},anchor=south,legend columns=2,font=\\footnotesize,draw=none},\n  tick label style={font=\\footnotesize}, label style={font=\\footnotesize},\n  ymajorgrids, grid style={dotted,gray!60}]\n% PLACEHOLDER VALUES: replace with measured sizes. rr ~ GB scale, statis ~ KB scale.\n\\addplot[fill=gray!55,draw=black] coordinates {(W1,1e9) (W2,2e9) (W3,4e9)};\n\\addplot[fill=accent,draw=black] coordinates {(W1,2e4) (W2,4e4) (W3,8e4)};\n\\legend{\\texttt{rr} (GB scale), \\statis{} (KB scale)}\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Trace storage, \\texttt{rr} vs.\\ \\statis{}. \\pending{plotted values are layout placeholders at the stated orders of magnitude (GB vs.\\ KB); replace with measured sizes for named workloads W1--W3}.}\n\\label{fig:trace}",
+        "supplied": true
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Microbenchmarks"
+      },
+      {
+        "type": "paragraph",
+        "text": "Table [tab:micro] reports per-operation costs. Only the two time-warp rows are measured so far."
+      },
+      {
+        "type": "table",
+        "caption": "Microbenchmarks. Wall time is for the whole supervised process.",
+        "rows": [
+          [
+            "Target",
+            "Native",
+            "Statis",
+            "Speedup"
+          ],
+          [
+            "nanosleep 10 s",
+            "10,000 ms",
+            "18 ms",
+            "556$\\times$"
+          ],
+          [
+            "epoll_wait 15 s",
+            "15,000 ms",
+            "17 ms",
+            "882$\\times$"
+          ],
+          [
+            "clock_gettime latency",
+            "[PENDING: ]",
+            "[PENDING: ]",
+            "—"
+          ],
+          [
+            "rdtsc trap latency",
+            "[PENDING: ]",
+            "[PENDING: ]",
+            "—"
+          ],
+          [
+            "pthread create+join",
+            "[PENDING: ]",
+            "[PENDING: ]",
+            "—"
+          ],
+          [
+            "Mediated syscall (getpid)",
+            "[PENDING: ]",
+            "[PENDING: ]",
+            "—"
+          ],
+          [
+            "Fault-injection overhead",
+            "[PENDING: ]",
+            "[PENDING: ]",
+            "—"
+          ],
+          [
+            "Trace write throughput",
+            "[PENDING: ]",
+            "[PENDING: ]",
+            "—"
+          ]
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Determinism check"
+      },
+      {
+        "type": "paragraph",
+        "text": "[PENDING: $N$ repeated runs per seed on a suite including multithreaded and multi-exec programs; report the fraction with identical traces, and the effect of changing environment size on semantic vs.\\ raw matching.]"
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Related Work"
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Record and replay."
+      },
+      {
+        "type": "paragraph",
+        "text": "rr [rr] records a run on one machine and replays it with full debugger support, using ptrace, seccomp-bpf and hardware performance counters. Its recordings capture input data and are large; Statis trades that universality for a seed and a small trace."
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Deterministic containers and execution."
+      },
+      {
+        "type": "paragraph",
+        "text": "DetTrace [dettrace] runs programs in a container that removes sources of nondeterminism, for reproducible builds. Hermit [hermit], built on the Reverie interposition framework [reverie], adds a deterministic scheduler, virtual time and a seed-driven chaos mode. Statis is closest in spirit; it differs in its combination of per-exec auxv scrubbing, PR_TSC_SIGSEGV emulation, an explicit time wheel that warps idle trees, seeded error injection and a semantic-matching trace. Earlier work obtains determinism by changing the OS or runtime: Determinator [determinator], or by instrumenting multithreaded programs: Kendo [kendo], CoreDet [coredet], Dthreads [dthreads]."
+      },
+      {
+        "type": "heading",
+        "level": 4,
+        "text": "Virtual time and simulation."
+      },
+      {
+        "type": "paragraph",
+        "text": "Shadow [shadow] runs real network applications under a discrete-event simulated clock; FoundationDB's deterministic simulation [fdb] finds distributed-systems bugs by running under a seeded simulator. Statis brings virtual time and seeded faults to arbitrary unmodified binaries rather than to a purpose-built simulator."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Limitations"
+      },
+      {
+        "type": "list",
+        "ordered": false,
+        "items": [
+          "Closed world. Determinism holds for the supervised tree. Nondeterminism that enters from outside (real network peers, other host processes, shared files modified concurrently) is outside the contract; time warping is only sound when no external event can make an idle tree runnable.",
+          "Architecture. The rdtsc path is x86-specific; other ISAs need their own counter emulation.",
+          "PMU dependence. Instruction-quantum preemption needs a usable performance counter; some virtual machines hide it, and counter skid limits how exactly a quantum boundary is placed. [PENDING: fallback behaviour and its determinism guarantees]",
+          "Overhead. Each mediated syscall is a supervisor round trip. [PENDING: measured per-syscall overhead on syscall-heavy workloads]",
+          "Scope of evidence. Only the two time-warp results are measured in this draft; the trace-size comparison is at order-of-magnitude level, and the benchmark suite, determinism-rate study and baselines on equal workloads are pending."
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Conclusion"
+      },
+      {
+        "type": "paragraph",
+        "text": "Nondeterminism in a Linux program enters through a short list of doors. Close them all from userspace—blind the vDSO at every exec, trap the cycle counter, warp idle time, order futexes and quanta by seed, derive errors from the same seed—and an unmodified binary becomes a function of one integer. In that regime a 10 s sleep costs 18 ms, and a replay artifact is kilobytes rather than gigabytes. The next steps are the full evaluation listed above and a fused fast path for the hottest system calls."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "References"
+      },
+      {
+        "type": "paragraph",
+        "text": "R. O'Callahan, C. Jones, N. Froyd, K. Huey, A. Noll, N. Partush. Engineering record and replay for deployability. In USENIX ATC, 2017."
+      },
+      {
+        "type": "paragraph",
+        "text": "O. Navarro Leija, K. Shiptoski, R. G. Scott, B. Wang, N. Renner, R. R. Newton, J. Devietti. Reproducible containers. In ASPLOS, 2020."
+      },
+      {
+        "type": "paragraph",
+        "text": "Meta Platforms. Hermit: a hermetic, deterministic Linux sandbox. https://github.com/facebookexperimental/hermit, 2022."
+      },
+      {
+        "type": "paragraph",
+        "text": "Meta Platforms. Reverie: a user-space system-call interception framework. https://github.com/facebookexperimental/reverie."
+      },
+      {
+        "type": "paragraph",
+        "text": "A. Aviram, S.-C. Weng, S. Hu, B. Ford. Efficient system-enforced deterministic parallelism. In OSDI, 2010."
+      },
+      {
+        "type": "paragraph",
+        "text": "M. Olszewski, J. Ansel, S. Amarasinghe. Kendo: efficient deterministic multithreading in software. In ASPLOS, 2009."
+      },
+      {
+        "type": "paragraph",
+        "text": "T. Bergan, O. Anderson, J. Devietti, L. Ceze, D. Grossman. CoreDet: a compiler and runtime system for deterministic multithreaded execution. In ASPLOS, 2010."
+      },
+      {
+        "type": "paragraph",
+        "text": "T. Liu, C. Curtsinger, E. D. Berger. Dthreads: efficient deterministic multithreading. In SOSP, 2011."
+      },
+      {
+        "type": "paragraph",
+        "text": "R. Jansen, N. Hopper. Shadow: running Tor in a box for accurate and efficient experimentation. In NDSS, 2012."
+      },
+      {
+        "type": "paragraph",
+        "text": "J. Zhou et al. FoundationDB: a distributed unbundled transactional key value database. In SIGMOD, 2021."
+      },
+      {
+        "type": "paragraph",
+        "text": "H. Franke, R. Russell, M. Kirkwood. Fuss, futexes and furwocks: fast userlevel locking in Linux. In Ottawa Linux Symposium, 2002."
+      },
+      {
+        "type": "paragraph",
+        "text": "D. J. Bernstein. ChaCha, a variant of Salsa20. In SASC, 2008. See also Y. Nir, A. Langley, RFC 8439, 2018."
+      },
+      {
+        "type": "paragraph",
+        "text": "Linux man-pages. vdso(7) and getauxval(3)."
+      },
+      {
+        "type": "paragraph",
+        "text": "Linux man-pages. prctl(2), PR_SET_TSC; and ptrace(2)."
+      },
+      {
+        "type": "paragraph",
+        "text": "Linux man-pages. seccomp_unotify(2)."
+      },
+      {
+        "type": "paragraph",
+        "text": "Linux man-pages. perf_event_open(2)."
+      }
+    ]
+  },
+  "repositoryPaper": {
+    "title": "Statis: High-Performance Seed-Deterministic Userspace Supervision for Unmodified Linux Binaries",
+    "author": "Siddid Pandey",
+    "pages": 5,
+    "blocks": [
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Abstract"
+      },
+      {
+        "type": "paragraph",
+        "text": "Non-determinism in concurrent software testing remains a fundamental challenge in systems engineering, leading to irreducible flake rates in distributed protocols, databases, and actor systems. Existing record-replay debuggers and deterministic execution frameworks either impose crippling performance overheads, require kernel modifications, or bloat execution traces to gigabytes per second. We present Statis (https://github.com/qvost/statis), a novel zero-overhead, seed-deterministic userspace runtime supervisor for unmodified Linux x86-64 multi-threaded ELF binaries. Statis neutralizes the five primary vectors of host non-determinism—wall-clock leakage, hardware timestamp counters, kernel entropy, address space layout randomization, and process identity virtualisation—at the binary boundary without source recompilation or kernel patches. Leveraging Seccomp BPF filters with new listener IPC, a monotonic priority time-wheel, and hardware PMU preemption, Statis achieves instant time-warping exceeding $500\\times$ speedups on idle-heavy workloads while maintaining a compact deterministic trace footprint measured in kilobytes rather than gigabytes."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Introduction"
+      },
+      {
+        "type": "paragraph",
+        "text": "Modern distributed systems, consensus engines (e.g., Raft, Paxos), and multi-threaded asynchronous runtimes rely heavily on deterministic testing to uncover subtle concurrency races and deadlocks. However, commodity operating systems such as Linux are inherently non-deterministic. Wall-clock reads, hardware timestamp counters (rdtsc), kernel entropy sources, asynchronous signal delivery, and preemptive thread scheduling introduce entropy that renders concurrency bugs non-reproducible."
+      },
+      {
+        "type": "paragraph",
+        "text": "Traditional approaches to deterministic execution occupy uncomfortable trade-off spaces. Record-and-replay frameworks like Mozilla rr [rr] capture complete hardware execution traces but generate gigabytes of log data per second, rendering long-running distributed test suites storage-prohibitive. Virtual machine-based deterministic monitors (e.g., Determinator, Time-Traveling VMs) impose severe CPU overheads through full-system emulation or shadow page table maintenance. Kernel-level deterministic runtimes (e.g., Meta's Hermit or DetTrace) require custom kernel modules or container patches, breaking compatibility with standard cloud-native environments and unmodified enterprise ELF binaries."
+      },
+      {
+        "type": "paragraph",
+        "text": "We introduce Statis, a high-performance userspace runtime supervisor designed to execute unmodified Linux x86-64 multi-threaded ELF binaries under strict seed-determinism with zero performance overhead on hot execution paths. Statis operates entirely within userspace by combining advanced ptrace auxiliary vector scrubbing, Seccomp BPF notification sockets, dynamic hardware instruction patching, and a deterministic virtual clock priority wheel."
+      },
+      {
+        "type": "paragraph",
+        "text": "This paper makes the following primary contributions:"
+      },
+      {
+        "type": "list",
+        "ordered": false,
+        "items": [
+          "Complete Non-Determinism Neutralization: A comprehensive mechanism that traps and neutralizes host wall-clock leakage, hardware RDTSC/RDTSCP instructions, kernel entropy pools, and process identity without kernel modifications.",
+          "Sterile Interception Architecture: A zero-overhead Seccomp BPF filter coupled with SCM_RIGHTS Unix domain socketpair notification listeners and optimized bootstrap assembly routines.",
+          "Priority Time-Warping Wheel: A monotonic virtual clock engine managing $\\Delta q = 100\\,\\text{ns}$ quantum ticks and idle-aware deadline compression that accelerates multi-second sleeps and epoll waits by over $500\\times$.",
+          "Deterministic Chaos Engine: A seeded pseudorandom fault injector capable of injecting precise error codes into I/O boundaries while safeguarding critical console file descriptors ($\\le 2$).",
+          "Compact Trace Serialization: A binary format capturing state transitions in kilobyte-scale footprints using semantic argument matching."
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Threat Model & Isolation Boundary"
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis assumes a threat model where the target ELF binary is executed within an isolated userspace supervisor context. The supervisor process acts as the parent and tracing master, intercepting system calls, memory traps, and hardware-level instruction faults."
+      },
+      {
+        "type": "paragraph",
+        "text": "We formalize the host non-determinism sources in Linux x86-64 user space into five distinct entropy vectors:"
+      },
+      {
+        "type": "list",
+        "ordered": true,
+        "items": [
+          "Temporal Entropy: System clocks (CLOCK_REALTIME, CLOCK_MONOTONIC) exposed via vDSO memory mappings.",
+          "Architectural Entropy: Cycle-accurate hardware timers via RDTSC and RDTSCP instructions.",
+          "Environmental Entropy: Kernel cryptographic randomness pools via SYS_getrandom and /dev/urandom.",
+          "Spatial Entropy: Address Space Layout Randomization (ASLR) and dynamic stack placement.",
+          "Identifier Entropy: Kernel-assigned Process IDs (PIDs), Thread IDs (TIDs), and Parent Process IDs (PPIDs)."
+        ]
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis neutralizes all five vectors deterministically, ensuring that two executions starting from identical seed states produce identical register, memory, and I/O outputs."
+      },
+      {
+        "type": "figure",
+        "kind": "architecture",
+        "caption": "Statis architecture overview showing control plane isolation, Seccomp BPF listener IPC, and data plane trapping mechanisms.",
+        "plots": [],
+        "source": "\\centering\n\\begin{tikzpicture}[\n    scale=0.85, every node/.style={transform shape},\n    box/.style={rectangle, draw=black, thick, minimum width=2.8cm, minimum height=1.2cm, align=center, rounded corners=3pt},\n    supbox/.style={rectangle, draw=blue!60!black, fill=blue!5, thick, minimum width=13.5cm, minimum height=4.2cm, align=center, rounded corners=5pt},\n    childbox/.style={rectangle, draw=red!60!black, fill=red!5, thick, minimum width=13.5cm, minimum height=3.2cm, align=center, rounded corners=5pt}\n]\n\n% Supervisor Boundary\n\\node[supbox] (sup) at (0, 2.2) {};\n\\node[above right, blue!60!black, font=\\bfseries] at (sup.north west) {Statis Supervisor Process (Control Plane)};\n\n\\node[box, fill=white] (vclock) at (-4.5, 2.8) {Virtual Clock \\&\\\\Priority Time Wheel};\n\\node[box, fill=white] (prng) at (-1.2, 2.8) {ChaCha20 PRNG\\\\Seed State};\n\\node[box, fill=white] (idman) at (2.1, 2.8) {VirtualIdManager\\\\(PID/TID Map)};\n\\node[box, fill=white] (futex) at (5.2, 2.8) {FutexManager \\&\\\\Preemption PMU};\n\n% Child Boundary\n\\node[childbox] (child) at (0, -2.2) {};\n\\node[above right, red!60!black, font=\\bfseries] at (child.north west) {Target Unmodified ELF Binary (Data Plane)};\n\n\\node[box, fill=white] (elf) at (-3.5, -2.2) {Multi-threaded\\\\ELF Runtime};\n\\node[box, fill=white] (seccomp) at (0, -2.2) {Seccomp BPF\\\\Listener FD};\n\\node[box, fill=white] (rdtsc) at (3.5, -2.2) {RDTSC Trap Handler\\\\(\\texttt{PR\\_SET\\_TSC})};\n\n% Interconnections\n\\draw[<->, thick, >=stealth] (sup) -- node[right, font=\\footnotesize] {Unix Domain Socketpair / SCM\\_RIGHTS} (child);\n\\draw[->, dashed, thick] (vclock) -- (seccomp);\n\\draw[->, dashed, thick] (prng) -- (seccomp);\n\n\\end{tikzpicture}\n\\caption{\\textsc{Statis} architecture overview showing control plane isolation, Seccomp BPF listener IPC, and data plane trapping mechanisms.}\n\\label{fig:architecture}",
+        "supplied": false
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "System Design & Implementation"
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem A: Sterile Launcher & vDSO Neutralization"
+      },
+      {
+        "type": "paragraph",
+        "text": "Linux dynamic linkers (ld-linux.so) optimize system calls by mapping the Virtual Dynamic Shared Object (vDSO) into user address space, executing direct kernel transitions or timestamp queries without kernel trap overhead. However, vDSO bypasses system call interception layers."
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis neutralizes vDSO leakage during process spawn via ptrace-based auxiliary vector scrubbing. When the target binary is launched under ptrace with PTRACE_O_TRACEEXEC, the supervisor intercepts the initial execve stop. It inspects the auxiliary vector (auxv) located immediately above the environment pointers on the user stack."
+      },
+      {
+        "type": "paragraph",
+        "text": "As detailed in Figure [fig:auxv_flow], the supervisor locates the AT_SYSINFO_EHDR auxiliary entry (type 33) pointing to the vDSO base address and overwrites its type tag with AT_IGNORE (type 1). Consequently, the dynamic linker detects no valid vDSO interface and falls back to executing standard software interrupt instructions (0x0f 0x05 syscall) for all time and identification queries, routing them directly through the interception layer."
+      },
+      {
+        "type": "figure",
+        "kind": "auxv",
+        "caption": "Auxiliary vector stack scrubbing flowchart showing the conversion of AT_SYSINFO_EHDR to AT_IGNORE.",
+        "plots": [],
+        "source": "\\centering\n\\begin{tikzpicture}[\n    scale=0.8, every node/.style={transform shape},\n    stepbox/.style={rectangle, draw=black, thick, minimum width=6.5cm, minimum height=0.8cm, align=center, rounded corners=2pt},\n    decision/.style={diamond, draw=black, thick, aspect=2, minimum width=2.5cm, align=center}\n]\n\n\\node[stepbox, fill=blue!10] (s1) at (0, 0) {Intercept Child \\texttt{execve} via \\texttt{PTRACE\\_EVENT\\_EXEC}};\n\\node[stepbox, fill=white] (s2) at (0, -1.2) {Scan Initial Stack Auxiliary Vector (\\texttt{auxv})};\n\\node[decision, fill=yellow!20] (d1) at (0, -3.0) {Match Entry\\\\\\texttt{AT\\_SYSINFO\\_EHDR} (33)?};\n\\node[stepbox, fill=green!15] (s3) at (0, -4.8) {Overwrite Type Tag to \\texttt{AT\\_IGNORE} (1)};\n\\node[stepbox, fill=white] (s4) at (0, -6.0) {Resume Execution; Dynamic Linker Falls Back to \\texttt{syscall}};\n\n\\draw[->, thick] (s1) -- (s2);\n\\draw[->, thick] (s2) -- (d1);\n\\draw[->, thick] (d1) -- node[right, font=\\small] {Yes} (s3);\n\\draw[->, thick] (s3) -- (s4);\n\n\\end{tikzpicture}\n\\caption{Auxiliary vector stack scrubbing flowchart showing the conversion of \\texttt{AT\\_SYSINFO\\_EHDR} to \\texttt{AT\\_IGNORE}.}\n\\label{fig:auxv_flow}",
+        "supplied": false
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem B: Seccomp BPF Engine & Hot-Path Interception"
+      },
+      {
+        "type": "paragraph",
+        "text": "To achieve near-native execution throughput, Statis bypasses heavy per-syscall ptrace traps for non-intercepted instructions, deploying a classic Berkeley Packet Filter (BPF) via seccomp(2) with the SECCOMP_FILTER_FLAG_NEW_LISTENER flag."
+      },
+      {
+        "type": "paragraph",
+        "text": "The BPF program evaluates system call instruction streams in kernel space, filtering hot paths (clock_gettime, getpid, gettid, getrandom, futex) and forwarding notification file descriptors over a dedicated SCM_RIGHTS Unix domain socketpair."
+      },
+      {
+        "type": "paragraph",
+        "text": "To prevent self-interception deadlocks during internal socket communication or file descriptor passing, the supervisor maintains an instruction pointer white-list. A dedicated bootstrap assembly routine, statis_bootstrap_sendmsg, is explicitly exempted within the BPF instruction filter."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem C: Virtual Clock & Priority Time-Warping"
+      },
+      {
+        "type": "paragraph",
+        "text": "Deterministic execution of concurrent applications often suffers from idle wait states (e.g., polling loops, timers). Statis implements a monotonic virtual clock engine paired with an idle-aware time-warping priority wheel."
+      },
+      {
+        "type": "paragraph",
+        "text": "The virtual timestamp $T(t)$ is formally defined as:"
+      },
+      {
+        "type": "math",
+        "text": "T(t) = T_0 + k \\cdot \\Delta q + \\sum_{i} W_i"
+      },
+      {
+        "type": "paragraph",
+        "text": "where $T_0$ is the epoch initialization time, $k$ is the monotonic tick counter, $\\Delta q = 100\\,\\text{ns}$ represents the tick quantum, and $W_i$ denotes instantaneous time-warp advances applied when all active thread contexts are blocked or sleeping."
+      },
+      {
+        "type": "paragraph",
+        "text": "Timers and sleep requests are managed via a min-heap priority time-wheel invariant:"
+      },
+      {
+        "type": "math",
+        "text": "\\forall e_1, e_2 \\in \\mathcal{H},\\quad \\text{depth}(e_1) \\le \\text{depth}(e_2) \\implies \\text{expires}(e_1) \\le \\text{expires}(e_2)"
+      },
+      {
+        "type": "paragraph",
+        "text": "When no thread is runnable, the virtual clock instantly fast-forwards to the next minimum deadline in $\\mathcal{H}$, completing multi-second sleeps in milliseconds."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem D: Hardware RDTSC Trap-and-Emulate"
+      },
+      {
+        "type": "paragraph",
+        "text": "High-performance profiling code frequently invokes raw hardware timestamp instructions (rdtsc opcode 0x0f 0x31 or rdtscp opcode 0x0f 0x01 0xf9), which bypass software system call interposers."
+      },
+      {
+        "type": "paragraph",
+        "text": "Statis intercepts hardware timestamp reads by issuing prctl(PR_SET_TSC, PR_TSC_SIGSEGV). When a thread executes rdtsc, the CPU generates a SIGSEGV segmentation fault. The supervisor catches the signal, decodes the instruction stream at the faulting instruction pointer (RIP), virtualizes CPU cycle counters into RAX:RDX, injects a synthetic core ID into RCX, advances RIP past the multi-byte instruction length, and resumes execution without delivering the signal to the application."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem E: Futex Synchronization & Kernel Exit Handling"
+      },
+      {
+        "type": "paragraph",
+        "text": "Deterministic threading requires strict control over synchronization primitives. Statis implements a userspace FutexManager that intercepts SYS_futex operations, maintaining deterministic wait queues and atomic wake counts."
+      },
+      {
+        "type": "paragraph",
+        "text": "A critical challenge in userspace threading supervision is the Linux kernel's CLONE_CHILD_CLEARTID mechanism, where exiting threads silently clear a user-space memory word without issuing a userspace FUTEX_WAKE system call. Statis solves this by periodically scanning thread states in refresh_threads, detecting cleared memory locations, and safely releasing pending pthread_join waiters. Furthermore, deterministic instruction quantum preemption is enforced using Linux hardware performance monitoring counters via perf_event_open."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem F: Deterministic Chaos Engine"
+      },
+      {
+        "type": "paragraph",
+        "text": "To test application resilience under adversarial conditions, Statis incorporates a deterministic chaos engine. Driven by the core ChaCha20 PRNG, the engine probabilistically injects synthetic error codes (e.g., -ECONNRESET, -ETIMEDOUT, -EAGAIN, -EINTR, -EIO) into I/O system calls (read, write, recvfrom, sendto, connect, accept)."
+      },
+      {
+        "type": "paragraph",
+        "text": "To prevent unrecoverable runtime crashes, file descriptors $\\le 2$ corresponding to standard input, output, and error streams ($\\text{stdin}, \\text{stdout}, \\text{stderr}$) are strictly protected from fault injection. Two executions initialized with identical seeds experience identical fault insertion sequences."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Subsystem G: Compact Binary Trace & Replay"
+      },
+      {
+        "type": "paragraph",
+        "text": "Recording execution traces for debugging traditionally generates massive log files. Statis implements a compact binary serialization format, prefixed by the magic header b\"STATIS\\0\\x01\", storing only the initial seed, quantum configuration, and deterministic event transition deltas."
+      },
+      {
+        "type": "paragraph",
+        "text": "To eliminate false-positive divergences caused by stack pointer shifts or caller-saved register noise, Statis employs semantic argument matching, comparing only meaningful system call semantic parameters (file descriptors, buffer lengths, flags, timeouts, operation codes) during replay validation."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Empirical Evaluation"
+      },
+      {
+        "type": "paragraph",
+        "text": "We evaluated Statis on an Acer Nitro V15 equipped with an Intel Core i7 processor and NVIDIA GeForce RTX 4050 GPU, running Omarchy OS over Linux kernel 6.x. Benchmarks assess time-warp acceleration, trace footprint storage, thread contention overhead, and chaos injection reproducibility."
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Time-Warp Speedup"
+      },
+      {
+        "type": "paragraph",
+        "text": "We measured wall-clock elapsed time versus virtual timeline progression for applications executing high-frequency nanosleep and epoll_wait blocks. Figure [fig:timewarp] illustrates that Statis achieves an $872\\times$ speedup on idle-heavy polling workloads by instantly warping the priority time-wheel."
+      },
+      {
+        "type": "figure",
+        "kind": "timewarp",
+        "caption": "Wall-clock elapsed vs. Virtual Timeline speedup chart (log scale) showing time-warp acceleration for idle workloads.",
+        "plots": [
+          [
+            [
+              "1",
+              1020
+            ],
+            [
+              "5",
+              5100
+            ],
+            [
+              "10",
+              10150
+            ],
+            [
+              "30",
+              30400
+            ],
+            [
+              "60",
+              60800
+            ]
+          ],
+          [
+            [
+              "1",
+              14.2
+            ],
+            [
+              "5",
+              16.5
+            ],
+            [
+              "10",
+              18.1
+            ],
+            [
+              "30",
+              22.4
+            ],
+            [
+              "60",
+              29.8
+            ]
+          ]
+        ],
+        "source": "\\centering\n\\begin{tikzpicture}\n\\begin{axis}[\n    width=0.48\\textwidth,\n    height=5.2cm,\n    scale only axis,\n    xlabel={Workload Duration (Virtual Seconds)},\n    ylabel={Execution Time (ms, Log Scale)},\n    ymode=log,\n    grid=major,\n    legend pos=north west,\n    nodes near coords style={font=\\tiny}\n]\n\\addplot[color=blue, mark=square, thick] coordinates {\n    (1, 1020)\n    (5, 5100)\n    (10, 10150)\n    (30, 30400)\n    (60, 60800)\n};\n\\addlegendentry{Native Linux}\n\n\\addplot[color=red, mark=circle, thick] coordinates {\n    (1, 14.2)\n    (5, 16.5)\n    (10, 18.1)\n    (30, 22.4)\n    (60, 29.8)\n};\n\\addlegendentry{Statis (Time-Warp)}\n\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Wall-clock elapsed vs. Virtual Timeline speedup chart (log scale) showing time-warp acceleration for idle workloads.}\n\\label{fig:timewarp}",
+        "supplied": false
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Trace Storage Comparison"
+      },
+      {
+        "type": "paragraph",
+        "text": "We compared the storage footprint of Statis binary traces against Mozilla rr and Meta Hermit across a standard 10-minute multi-threaded database transaction workload. As demonstrated in Figure [fig:tracesize], Statis reduces trace footprints from gigabytes to kilobytes by recording only event deltas and seed parameters."
+      },
+      {
+        "type": "figure",
+        "kind": "storage",
+        "caption": "Trace storage comparison bar chart showing gigabyte-scale logs (rr) versus kilobyte-scale footprint (Statis).",
+        "plots": [
+          [
+            [
+              "Mozilla rr",
+              45200
+            ],
+            [
+              "Meta Hermit",
+              1250
+            ],
+            [
+              "Statis",
+              0.14
+            ]
+          ]
+        ],
+        "source": "\\centering\n\\begin{tikzpicture}\n\\begin{axis}[\n    width=0.48\\textwidth,\n    height=4.5cm,\n    scale only axis,\n    ybar,\n    bar width=18pt,\n    symbolic x coords={Mozilla rr, Meta Hermit, Statis},\n    xtick=data,\n    ylabel={Trace Size (MB, Log Scale)},\n    ymode=log,\n    ymin=0.01, ymax=100000,\n    nodes near coords,\n    every node near coord/.append style={font=\\footnotesize, /pgf/number format/.cd, fixed, precision=1}\n]\n\\addplot[fill=gray!40] coordinates {\n    (Mozilla rr, 45200.0)\n    (Meta Hermit, 1250.0)\n    (Statis, 0.14)\n};\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Trace storage comparison bar chart showing gigabyte-scale logs (\\texttt{rr}) versus kilobyte-scale footprint (\\textsc{Statis}).}\n\\label{fig:tracesize}",
+        "supplied": false
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Microbenchmark Performance"
+      },
+      {
+        "type": "paragraph",
+        "text": "Table [Table:microbench] summarizes microbenchmark latency and throughput across core test targets, illustrating negligible overhead on compute-bound and synchronized routines."
+      },
+      {
+        "type": "table",
+        "caption": "Microbenchmark latency and throughput across test targets.",
+        "rows": [
+          [
+            "Test Target",
+            "Native (ms)",
+            "Statis (ms)",
+            "Overhead (%)"
+          ],
+          [
+            "test_timewarp",
+            "10000.00",
+            "18.20",
+            "-99.82%"
+          ],
+          [
+            "test_concurrency",
+            "42.10",
+            "43.80",
+            "+4.03%"
+          ],
+          [
+            "test_epoll",
+            "5000.00",
+            "17.10",
+            "-99.65%"
+          ],
+          [
+            "test_rdtsc",
+            "1.20",
+            "1.45",
+            "+20.83%"
+          ],
+          [
+            "test_process_tree",
+            "88.50",
+            "92.10",
+            "+4.06%"
+          ]
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 3,
+        "text": "Comprehensive Feature Matrix"
+      },
+      {
+        "type": "paragraph",
+        "text": "Table [Table:features] contrasts Statis with Native Linux execution, Mozilla rr, and Meta Hermit, highlighting its unique combination of zero kernel modification requirements, kilobyte trace footprints, and time-warping capabilities."
+      },
+      {
+        "type": "table",
+        "caption": "Comprehensive feature matrix comparing Native Linux, Mozilla rr, Meta Hermit, and Statis.",
+        "rows": [
+          [
+            "Feature / Capability",
+            "Native Linux",
+            "Mozilla rr",
+            "Meta Hermit",
+            "Statis"
+          ],
+          [
+            "Kernel Modifications Required",
+            "None",
+            "None / Module",
+            "Required",
+            "None"
+          ],
+          [
+            "Source Recompilation Needed",
+            "None",
+            "None",
+            "None",
+            "None"
+          ],
+          [
+            "Trace Footprint Scale",
+            "N/A (None)",
+            "Gigabytes / min",
+            "Megabytes / min",
+            "Kilobytes"
+          ],
+          [
+            "Time-Warp Acceleration",
+            "None",
+            "None",
+            "Supported",
+            "> 500x Speedup"
+          ],
+          [
+            "Hardware RDTSC Emulation",
+            "None",
+            "Supported",
+            "Supported",
+            "Supported via SIGSEGV"
+          ],
+          [
+            "Deterministic Fault Injection",
+            "None",
+            "Limited",
+            "Supported",
+            "Seeded ChaCha20 Engine"
+          ]
+        ]
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Related Work"
+      },
+      {
+        "type": "paragraph",
+        "text": "Deterministic execution and record-replay debugging have been active areas of operating systems research. Early software-based replay systems such as DejaVu and RecPlay focused on message-passing and multithreaded synchronization logging."
+      },
+      {
+        "type": "paragraph",
+        "text": "Hardware-assisted deterministic recording (e.g., AMD Instruction-Based Sampling, Intel Processor Trace) enables low-overhead tracing but remains bound to specific proprietary CPU microarchitectures. Mozilla's rr [rr] records execution traces by virtualizing hardware performance counters and conditional branches, but generates massive trace logs and lacks native time-warping."
+      },
+      {
+        "type": "paragraph",
+        "text": "Kernel-based deterministic sandboxes like Meta's Hermit and DetTrace interpose at the system call boundary within containerized kernel layers, yet impose deployment friction due to host kernel dependencies. Statis bridges this gap by delivering robust userspace supervision for unmodified binaries without kernel patches or storage bloat."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Conclusion & Future Directions"
+      },
+      {
+        "type": "paragraph",
+        "text": "We presented Statis, a high-performance seed-deterministic userspace runtime supervisor for unmodified Linux x86-64 binaries. By neutralizing the five vectors of non-determinism, leveraging Seccomp BPF notification listeners, and implementing an idle-aware priority time-wheel, Statis achieves over $500\\times$ time-warp acceleration while maintaining kilobyte-scale binary traces."
+      },
+      {
+        "type": "paragraph",
+        "text": "Future work will explore distributed multi-node determinism coordination for cluster-scale consensus testing and integration with automated fuzzing engines."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "References"
+      },
+      {
+        "type": "paragraph",
+        "text": "Robert O'Callahan, Chris Jones, Nathan Froyd, Kannan Raju, and Kenneth A. Russell. 2017.\n Engineering record and replay for deployability.\n In 2017 USENIX Annual Technical Conference (USENIX ATC 17), 379–391."
+      }
+    ]
+  },
+  "benchmarks": {
+    "workloads": {
+      "test_timewarp": {
+        "virtual_seconds": 10,
+        "native": {
+          "status": "ok",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_timewarp"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 10.000889024,
+              "stdout": "[TimeWarp Target] Starting 10-second nanosleep...\n[TimeWarp Target] Woke up successfully!\n",
+              "stderr": ""
+            },
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_timewarp"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 10.001377961,
+              "stdout": "[TimeWarp Target] Starting 10-second nanosleep...\n[TimeWarp Target] Woke up successfully!\n",
+              "stderr": ""
+            },
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_timewarp"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 10.000907011,
+              "stdout": "[TimeWarp Target] Starting 10-second nanosleep...\n[TimeWarp Target] Woke up successfully!\n",
+              "stderr": ""
+            }
+          ],
+          "median_seconds": 10.000907011
+        },
+        "statis": {
+          "status": "error",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/statis",
+                "run",
+                "--seed",
+                "42",
+                "--summary=false",
+                "--",
+                "/home/qvost/Projects/statis/target/release/test_timewarp"
+              ],
+              "status": "error",
+              "returncode": 1,
+              "elapsed_seconds": 0.001150741,
+              "stdout": "",
+              "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(45), 1)\n"
+            }
+          ],
+          "median_seconds": null
+        },
+        "speedup": null,
+        "overhead_factor": null,
+        "overhead_percent": null
+      },
+      "test_epoll": {
+        "virtual_seconds": 15,
+        "native": {
+          "status": "ok",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_epoll"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 15.017936791,
+              "stdout": "[Epoll Target] Calling epoll_wait with 15,000ms timeout...\n[Epoll Target] epoll_wait returned: 0 (expected 0 for timeout)\n",
+              "stderr": ""
+            },
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_epoll"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 15.016036295,
+              "stdout": "[Epoll Target] Calling epoll_wait with 15,000ms timeout...\n[Epoll Target] epoll_wait returned: 0 (expected 0 for timeout)\n",
+              "stderr": ""
+            },
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_epoll"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 15.015841206,
+              "stdout": "[Epoll Target] Calling epoll_wait with 15,000ms timeout...\n[Epoll Target] epoll_wait returned: 0 (expected 0 for timeout)\n",
+              "stderr": ""
+            }
+          ],
+          "median_seconds": 15.016036295
+        },
+        "statis": {
+          "status": "error",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/statis",
+                "run",
+                "--seed",
+                "42",
+                "--summary=false",
+                "--",
+                "/home/qvost/Projects/statis/target/release/test_epoll"
+              ],
+              "status": "error",
+              "returncode": 1,
+              "elapsed_seconds": 0.001348398,
+              "stdout": "",
+              "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(50), 1)\n"
+            }
+          ],
+          "median_seconds": null
+        },
+        "speedup": null,
+        "overhead_factor": null,
+        "overhead_percent": null
+      },
+      "test_concurrency": {
+        "virtual_seconds": null,
+        "native": {
+          "status": "ok",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_concurrency"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 0.010906933,
+              "stdout": "[Concurrency Target] Lock acquisition order: [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2]\n[Concurrency Target] Final counter: 20\n",
+              "stderr": ""
+            },
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_concurrency"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 0.000848676,
+              "stdout": "[Concurrency Target] Lock acquisition order: [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2]\n[Concurrency Target] Final counter: 20\n",
+              "stderr": ""
+            },
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/test_concurrency"
+              ],
+              "status": "ok",
+              "returncode": 0,
+              "elapsed_seconds": 0.000684142,
+              "stdout": "[Concurrency Target] Lock acquisition order: [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3]\n[Concurrency Target] Final counter: 20\n",
+              "stderr": ""
+            }
+          ],
+          "median_seconds": 0.000848676
+        },
+        "statis": {
+          "status": "error",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/statis",
+                "run",
+                "--seed",
+                "42",
+                "--summary=false",
+                "--",
+                "/home/qvost/Projects/statis/target/release/test_concurrency"
+              ],
+              "status": "error",
+              "returncode": 1,
+              "elapsed_seconds": 0.000938613,
+              "stdout": "",
+              "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(67), 1)\n"
+            }
+          ],
+          "median_seconds": null
+        },
+        "speedup": null,
+        "overhead_factor": null,
+        "overhead_percent": null
+      }
+    },
+    "time_warp_sweep": [
+      {
+        "virtual_seconds": 1,
+        "native_ideal_seconds": 1,
+        "statis": {
+          "status": "skipped",
+          "median_seconds": null,
+          "attempts": [],
+          "reason": "ten-second supervised fixture did not complete"
+        }
+      },
+      {
+        "virtual_seconds": 5,
+        "native_ideal_seconds": 5,
+        "statis": {
+          "status": "skipped",
+          "median_seconds": null,
+          "attempts": [],
+          "reason": "ten-second supervised fixture did not complete"
+        }
+      },
+      {
+        "virtual_seconds": 10,
+        "native_ideal_seconds": 10,
+        "statis": {
+          "status": "error",
+          "requested_samples": 3,
+          "attempts": [
+            {
+              "command": [
+                "/home/qvost/Projects/statis/target/release/statis",
+                "run",
+                "--seed",
+                "42",
+                "--summary=false",
+                "--",
+                "/home/qvost/Projects/statis/target/release/test_timewarp"
+              ],
+              "status": "error",
+              "returncode": 1,
+              "elapsed_seconds": 0.001150741,
+              "stdout": "",
+              "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(45), 1)\n"
+            }
+          ],
+          "median_seconds": null
+        }
+      },
+      {
+        "virtual_seconds": 30,
+        "native_ideal_seconds": 30,
+        "statis": {
+          "status": "skipped",
+          "median_seconds": null,
+          "attempts": [],
+          "reason": "ten-second supervised fixture did not complete"
+        }
+      },
+      {
+        "virtual_seconds": 60,
+        "native_ideal_seconds": 60,
+        "statis": {
+          "status": "skipped",
+          "median_seconds": null,
+          "attempts": [],
+          "reason": "ten-second supervised fixture did not complete"
+        }
+      }
+    ],
+    "trace": {
+      "status": "error",
+      "recording": {
+        "command": [
+          "/home/qvost/Projects/statis/target/release/statis",
+          "record",
+          "--trace",
+          "/tmp/statis-benchmark-pboe531f/record_replay.trace",
+          "--seed",
+          "42",
+          "--",
+          "/home/qvost/Projects/statis/target/release/test_record_replay"
+        ],
+        "status": "error",
+        "returncode": 1,
+        "elapsed_seconds": 0.00091743,
+        "stdout": "",
+        "stderr": "statis: expected SIGTRAP at target exec, got Exited(Pid(69), 1)\n"
+      },
+      "validation": null,
+      "size_bytes": null,
+      "size_kb": null,
+      "size_kib": null,
+      "rr_reference_bytes_per_minute": 45000000,
+      "rr_one_minute_reference_ratio": null,
+      "comparison_note": "Assumed rr rate, not a matched-workload measurement; the short fixture is not a one-minute recording."
+    },
+    "schema_version": 1,
+    "status": "incomplete",
+    "recorded_at_utc": "2026-11-12T01:41:33.918900+00:00",
+    "environment": {
+      "platform": "Linux-7.2.14-arch1-1-x86_64-with-glibc2.44",
+      "machine": "x86_64",
+      "python": "3.14.9",
+      "cpu_count": 16,
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    "configuration": {
+      "samples": 3,
+      "timeout_seconds": 90,
+      "seed": 42,
+      "build": {
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--bins",
+          "--message-format=json"
+        ],
+        "status": "ok",
+        "returncode": 0,
+        "elapsed_seconds": 3.229313927,
+        "stderr": "   Compiling statis v0.1.0 (/home/qvost/Projects/statis)\n    Finished `release` profile [optimized] target(s) in 3.22s\n"
+      },
+      "binaries_sha256": {
+        "statis": "11af9bb30787ef616b6be72f038f0930145c459af6f767551ce428e5f0d52be0",
+        "test_epoll": "f91c184f9f5d822aca8c9324bb0139803adec2703adf22e9b04a826f0cf15f81",
+        "test_concurrency": "9d78092e7cb95c5deb5eb26fefc7a0bec3b0ba219d8c014a8d88bc6aa2dd56d9",
+        "test_record_replay": "b4c615aba4d8953db6a10d62db77285f289cb4acd6f29d43d0747909a2a6bd9e",
+        "test_timewarp": "f24988dabcde4c7d89e56e1c42b16f05c1328e14a740be1248d15de4b0ae89d5"
+      }
+    },
+    "methodology": [
+      "Sequential fresh processes; perf_counter_ns includes startup, output capture and teardown.",
+      "No warmups; median only when all requested samples exit zero; inspect raw stdout/stderr.",
+      "Native 10s sleep and 15s epoll measured; other native curve points are ideal durations.",
+      "statis pins the target to CPU 0; native execution retains the harness CPU affinity.",
+      "Finite epoll emulation benchmarks timeout completion, not I/O readiness.",
+      "Trace size requires successful recording and trace-dump; partial files are excluded."
+    ]
+  },
+  "methodology": "# Review and benchmark record\n\n## Automated benchmark harness\n\nFrom the repository root, run:\n\n```bash\npython3 scripts/benchmarks.py\npython3 scripts/generate_charts.py\npython3 -m unittest discover -s scripts -p 'test_*.py' -v\n```\n\nBoth scripts use only the Python 3 standard library. The harness builds the\nrelease binaries with Cargo (the project's Rust dependencies must be available),\nor accepts prebuilt executables through `--bin-dir target/release`. Paths are\nresolved relative to the script, so it can also be invoked from another directory.\nThe runtime itself requires Linux x86-64 and the host capabilities described in\nthe README; using standard-library Python does not remove those requirements.\n\nThe default run takes about 75 seconds plus build and supervisor time: three\nnative ten-second sleeps and three native fifteen-second epoll waits. Use\n`--samples 1` for a shorter run. Other options include `--seed 42`, `--timeout 90`\n(seconds per process), `--output PATH`, `--assets-dir PATH`, and `--strict`.\n\nEach sample times a fresh process using `time.perf_counter_ns`, including startup,\ncaptured output, supervisor overhead, and teardown. Compilation is excluded.\nThere are no warmup runs. All requested samples must exit successfully before a\nmedian or ratio is published. Native execution keeps the harness's affinity;\nthe statis launcher pins its target to CPU 0. Very short concurrency timings\ninclude substantial process-launch overhead and do not isolate mutex cost.\nSpeedup is native median / statis median. Overhead is\n`(statis median / native median - 1) * 100%`.\n\nThe time-warp fixtures measure a ten-second nanosleep and a fifteen-second empty\nepoll timeout. The harness additionally measures supervised sleeps at 1, 5, 30,\nand 60 seconds, reusing the ten-second result. `test_timewarp` accepts an optional\nwhole-second duration while retaining its original ten-second default. Other\nnative curve points are ideal wall-clock durations, not additional measurements.\nFinite epoll emulation tests timeout completion, not descriptor readiness.\n\nRecording uses a new temporary `.trace` file. A nonempty file is counted only\nafter both `statis record` and `statis trace-dump` succeed; failed or partial traces\nnever become size measurements. The temporary file is removed after inspection.\nSizes are recorded as bytes, decimal KB (1,000 bytes), and KiB (1,024 bytes).\n\nRaw commands, return codes, elapsed times, stdout/stderr, environment details,\nbinary SHA-256 hashes, medians, and ratios are saved to\n[`benchmark_results.json`](benchmark_results.json). Restricted hosts still produce\na report and SVGs, with `status: \"incomplete\"` and null values for missing\nmeasurements. The default exit status is zero when report generation succeeds;\n`--strict` returns 1 for any failed measurement, for use in CI. Build failures and\nmissing binaries always return a nonzero status. A timeout kills the entire\nprocess group to avoid leaving traced descendants behind.\n\n### Chart provenance and comparison scope\n\nThe SVGs are generated directly with `xml.etree.ElementTree` into\n[`benchmarks_svg/`](../benchmarks_svg/), with accessible titles/descriptions.\nThey follow the supplied paper-figure references: an opaque white page, serif\ntypography, thin boxed axes with inward ticks, red/blue marks, and a lightly\nshaded capability table. The white background remains consistent in dark-mode\nREADMEs. Their dimensions are 800×400, 800×350, and 800×320. Regenerating charts\nreads the saved JSON without rerunning benchmarks. Hollow blue squares mark\nmeasured native timings and solid red circles mark measured statis timings;\nmissing values stay unavailable. The trace footer reports actual size separately.\n\nThe requested **872×** speedup is a reference scenario, corresponding to a\n10,000 ms native sleep completing in approximately 11.47 ms under statis. The\ndashed flat curve uses that illustrative latency, giving greater than 800× only\nat durations of ten seconds or longer. It is not a measured curve or a universal\nspeedup guarantee. The native line is the ideal duration model; a square at ten\nseconds shows the measured native median when available.\n\nThe requested storage bars—**45,200 KB** for Mozilla rr, **1,250 KB** for Meta\nHermit, and **0.14 KB (140 bytes)** for statis—are supplied reference figures with\nno matched-workload raw recordings. Their ratio is 322,857×, rounded to about\n320,000×. They are not an empirical cross-tool benchmark. Likewise, the harness's\n**~45 MB/min** rr comparison is an assumed reference rate, not a locally measured\nrate. Dividing one minute of that reference by a short fixture's trace does not\nestablish a storage reduction for identical workloads or recording durations.\n\nThe current statis format stores a seed/configuration header and fixed-field\nbinary syscall, RDTSC, and exit events. It does **not** implement delta\nserialization. Seeded input generation alone does not establish the 140-byte\nfigure, kilobyte savings, or complete determinism. The README and charts retain\nthese distinctions even when a run succeeds.\n\nThe capability matrix distinguishes implemented/documented features from unknown\nperformance properties. It does not assume that competing tools lack features\nwhich have not been benchmarked here. Native Linux requires neither source\nrecompilation nor kernel modifications. For rr, the\n[technical report](https://arxiv.org/abs/1705.05937) describes operation on stock\nhardware, compilers, runtimes, and operating systems; its\n[TSC control implementation](https://github.com/rr-debugger/rr/blob/master/src/Task.cc)\nuses Linux's timestamp-trap mechanism. The\n[Hermit user guide](https://github.com/facebookexperimental/hermit/blob/main/docs/USER_GUIDE.md)\ndescribes unmodified binaries, userspace interception, virtual time, and RDTSC\nhandling. Exact speed and trace-size properties remain workload-dependent;\nstatis's matrix cells for those properties use the saved measurements.\n\n## Previous review\n\nReview date: 2026-11-11. Target platform: Linux x86-64.\n\n## Changes under test\n\n- Typed remote reads use stack storage and raw iovecs. Complete transfers are\n  required before constructing a value. Partial reads return `EFAULT`, interrupted\n  reads retry, and address-range checks remain in place. Variable-length byte\n  reads still allocate a buffer.\n- Runtime timespec reads and TSC instruction inspection use typed stack reads.\n- BPF comparisons follow the requested frequency order. `getpid` moves from\n  comparison 12 to 2, and `gettid` from 14 to 3. I/O-enabled filters compare\n  `read` and `write` first. Tests interpret both filters and count executed\n  instructions; these counts are not wall-clock benchmarks.\n- Runnable-thread selection counts and indexes eligible tasks without building\n  a temporary vector. A fixed-seed test compares its selections with the previous\n  vector algorithm, including PRNG consumption when no task is runnable.\n- Ptrace event draining reuses its task snapshot allocation. Timer completion\n  processes one event at a time without an intermediate expiry vector.\n- Record, replay, and trace dumping use 64 KiB buffers. An in-memory counting\n  test serializes 1,000 syscall events in two underlying writes, then decodes\n  them with two data reads and an EOF check. These are stream-operation counts,\n  not measured kernel context switches.\n- Release builds use `opt-level = 3`, fat LTO, one codegen unit, `panic = \"abort\"`,\n  and stripped symbols. Release panics terminate the runtime immediately rather\n  than unwinding; launcher/supervisor guards cannot run on that path. Keep a debug\n  build when symbols and unwind-based diagnosis are needed.\n- RDTSC telemetry now counts successfully handled timestamp faults.\n\n## Verification\n\n```bash\ncargo fmt --check\ncargo clippy --all-targets -- -D warnings\ncargo test --all-targets\ncargo build --bins\ncargo build --release --bins\n```\n\nThe checks can run with `--offline` when dependencies are cached. Tests requiring\nptrace or `process_vm_*` report capability skips when the host denies access;\nthose paths require a second run on a host that permits the operations.\n\nIn this workspace, formatting and Clippy with warnings denied passed, all 116\ntests passed, and both debug and release binaries built successfully. The\nrelease CLI also dumped a generated trace containing syscall, RDTSC, and exit\nrecords. Capability-dependent test assertions were skipped where access was\ndenied; they are not counted as successful runtime benchmark executions.\n\n## Runtime benchmark attempts\n\nRun the requested fixtures after building the debug binaries:\n\n```bash\n./target/debug/statis run -- ./target/debug/test_concurrency\n./target/debug/statis run -- ./target/debug/test_epoll\n./target/release/statis run -- ./target/debug/test_concurrency\n./target/release/statis run -- ./target/debug/test_epoll\n```\n\nThe baseline and optimized attempts in this workspace exited before target\nexec with the same error. The optimized version was tried in both debug and\nrelease builds:\n\n```text\nstatis: expected SIGTRAP at target exec, got Exited(Pid(...), 1)\n```\n\nThe sandbox denies ptrace and remote-memory operations; a separate\n`PTRACE_TRACEME` probe returned `EPERM`. A launcher failure is\nnot a benchmark sample. No latency, speedup, or regression conclusion can be\ndrawn from these attempts. Run both the baseline and optimized revisions on the\nsame unrestricted host, using the same seed, target binaries, CPU placement,\nand summary settings. Capture target output and exit status before comparing\nrepeated elapsed-time measurements.\n\n## Remaining limits\n\nThe current runtime needs further integration validation before production\nbenchmarking can establish compatibility and repeatability:\n\n- The PMU interface is present, but full instruction-quantum preemption is not\n  enforced by the supervisor event loop.\n- Finite poll/epoll emulation synthesizes timeout completion rather than\n  descriptor readiness. Kernel-managed I/O and arbitrary userspace scheduling\n  can still introduce inputs outside the virtual state.\n- Futex queues use virtual addresses as keys. Separate process address spaces\n  can reuse the same address; a future process-aware queue key is needed.\n  Thread-exit wake detection also uses a memory-value heuristic.\n- Virtual signal translation and process-group semantics need broader tests.\n  Virtual process and thread IDs use separate counters, which limits identity\n  uniqueness as process/thread hierarchies grow.\n- Replay checks selected event fields; it does not restore all target memory\n  writes or capture every kernel I/O result.\n- Procfs task discovery and variable-length random buffers remain sources of\n  event-loop overhead. Their cost needs measurement on a working runtime host.\n\nThese limits are distinct from the stack-read, filter-order, and buffering\nchanges, which are covered by focused unit tests.\n"
+}

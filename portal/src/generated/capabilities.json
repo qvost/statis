@@ -1,0 +1,9 @@
+{
+  "@vfx-js/core": false,
+  "@vfx-js/react": false,
+  "@vfx-js/transitions": false,
+  "@gsap/react": false,
+  "lenis": false,
+  "three": false,
+  "@types/three": false
+}

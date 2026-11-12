@@ -1,0 +1,192 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400" role="img" aria-labelledby="title description">
+  <title id="title">Time-warp acceleration</title>
+  <desc id="description">Paper-style log-scale plot. Native durations are an ideal model; the dashed statis curve is an illustrative 872x reference at ten seconds, not an empirical result. Solid red circles, if present, are measured statis medians.</desc>
+  <style>
+            :root { color-scheme: only light; }
+            text { font-family: 'Times New Roman', 'Liberation Serif', 'Nimbus Roman', serif;
+                   fill: #111; font-size: 17px; font-weight: 400; }
+            .small { font-size: 13px; }
+            .note { font-size: 14px; }
+            .label { font-size: 21px; }
+            .muted { fill: #444; }
+            .grid { stroke: #c9c9c9; stroke-width: 0.5; }
+            .axis { stroke: #111; stroke-width: 0.8; }
+            .native { stroke: #3188bd; }
+            .reference, .measured { stroke: #c4382b; }
+            .accent { fill: #c4382b; }
+        </style>
+  <rect x="0" y="0" width="800" height="400" fill="white" />
+  <rect x="106" y="12" width="640" height="59" fill="white" stroke="#111" stroke-width="0.8" />
+  <line x1="122" y1="31" x2="151" y2="31" class="native" stroke-width="2" stroke-dasharray="none" />
+  <rect x="132.5" y="27.5" width="7" height="7" fill="#3188bd" stroke="#3188bd" stroke-width="1.3" />
+  <text x="162" y="36" text-anchor="start" class="">Native Linux (ideal duration)</text>
+  <line x1="441" y1="31" x2="470" y2="31" class="reference" stroke-width="2" stroke-dasharray="6 4" />
+  <circle cx="455" cy="31" r="3.8" fill="white" stroke="#c4382b" stroke-width="1.3" />
+  <text x="481" y="36" text-anchor="start" class="">statis (872× reference)</text>
+  <rect x="132.5" y="50.5" width="7" height="7" fill="white" stroke="#3188bd" stroke-width="1.3" />
+  <text x="162" y="59" text-anchor="start" class="note">Native Linux (measured at 10s)</text>
+  <text x="441" y="59" text-anchor="start" class="note muted">statis measurements unavailable</text>
+  <line x1="91" y1="282.0" x2="766" y2="282.0" class="grid" />
+  <line x1="91" y1="282.0" x2="98" y2="282.0" class="axis" />
+  <line x1="759" y1="282.0" x2="766" y2="282.0" class="axis" />
+  <text x="79" y="287.0" text-anchor="end" class="">10<tspan dy="-6" font-size="11">0</tspan>
+  </text>
+  <line x1="91" y1="270.07921217170633" x2="95" y2="270.07921217170633" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="270.07921217170633" x2="766" y2="270.07921217170633" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="263.1059983131014" x2="95" y2="263.1059983131014" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="263.1059983131014" x2="766" y2="263.1059983131014" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="258.15842434341266" x2="95" y2="258.15842434341266" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="258.15842434341266" x2="766" y2="258.15842434341266" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="254.32078782829365" x2="95" y2="254.32078782829365" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="254.32078782829365" x2="766" y2="254.32078782829365" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="251.18521048480773" x2="95" y2="251.18521048480773" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="251.18521048480773" x2="766" y2="251.18521048480773" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="248.53411761543543" x2="95" y2="248.53411761543543" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="248.53411761543543" x2="766" y2="248.53411761543543" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="246.23763651511905" x2="95" y2="246.23763651511905" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="246.23763651511905" x2="766" y2="246.23763651511905" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="244.21199662620273" x2="95" y2="244.21199662620273" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="244.21199662620273" x2="766" y2="244.21199662620273" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="242.4" x2="766" y2="242.4" class="grid" />
+  <line x1="91" y1="242.4" x2="98" y2="242.4" class="axis" />
+  <line x1="759" y1="242.4" x2="766" y2="242.4" class="axis" />
+  <text x="79" y="247.4" text-anchor="end" class="">10<tspan dy="-6" font-size="11">1</tspan>
+  </text>
+  <line x1="91" y1="230.47921217170634" x2="95" y2="230.47921217170634" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="230.47921217170634" x2="766" y2="230.47921217170634" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="223.50599831310137" x2="95" y2="223.50599831310137" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="223.50599831310137" x2="766" y2="223.50599831310137" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="218.5584243434127" x2="95" y2="218.5584243434127" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="218.5584243434127" x2="766" y2="218.5584243434127" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="214.72078782829368" x2="95" y2="214.72078782829368" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="214.72078782829368" x2="766" y2="214.72078782829368" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="211.5852104848077" x2="95" y2="211.5852104848077" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="211.5852104848077" x2="766" y2="211.5852104848077" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="208.9341176154354" x2="95" y2="208.9341176154354" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="208.9341176154354" x2="766" y2="208.9341176154354" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="206.63763651511903" x2="95" y2="206.63763651511903" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="206.63763651511903" x2="766" y2="206.63763651511903" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="204.61199662620274" x2="95" y2="204.61199662620274" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="204.61199662620274" x2="766" y2="204.61199662620274" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="202.8" x2="766" y2="202.8" class="grid" />
+  <line x1="91" y1="202.8" x2="98" y2="202.8" class="axis" />
+  <line x1="759" y1="202.8" x2="766" y2="202.8" class="axis" />
+  <text x="79" y="207.8" text-anchor="end" class="">10<tspan dy="-6" font-size="11">2</tspan>
+  </text>
+  <line x1="91" y1="190.87921217170634" x2="95" y2="190.87921217170634" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="190.87921217170634" x2="766" y2="190.87921217170634" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="183.90599831310135" x2="95" y2="183.90599831310135" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="183.90599831310135" x2="766" y2="183.90599831310135" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="178.95842434341267" x2="95" y2="178.95842434341267" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="178.95842434341267" x2="766" y2="178.95842434341267" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="175.12078782829366" x2="95" y2="175.12078782829366" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="175.12078782829366" x2="766" y2="175.12078782829366" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="171.9852104848077" x2="95" y2="171.9852104848077" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="171.9852104848077" x2="766" y2="171.9852104848077" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="169.33411761543545" x2="95" y2="169.33411761543545" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="169.33411761543545" x2="766" y2="169.33411761543545" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="167.03763651511903" x2="95" y2="167.03763651511903" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="167.03763651511903" x2="766" y2="167.03763651511903" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="165.01199662620274" x2="95" y2="165.01199662620274" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="165.01199662620274" x2="766" y2="165.01199662620274" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="163.2" x2="766" y2="163.2" class="grid" />
+  <line x1="91" y1="163.2" x2="98" y2="163.2" class="axis" />
+  <line x1="759" y1="163.2" x2="766" y2="163.2" class="axis" />
+  <text x="79" y="168.2" text-anchor="end" class="">10<tspan dy="-6" font-size="11">3</tspan>
+  </text>
+  <line x1="91" y1="151.27921217170635" x2="95" y2="151.27921217170635" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="151.27921217170635" x2="766" y2="151.27921217170635" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="144.30599831310136" x2="95" y2="144.30599831310136" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="144.30599831310136" x2="766" y2="144.30599831310136" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="139.35842434341268" x2="95" y2="139.35842434341268" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="139.35842434341268" x2="766" y2="139.35842434341268" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="135.52078782829366" x2="95" y2="135.52078782829366" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="135.52078782829366" x2="766" y2="135.52078782829366" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="132.3852104848077" x2="95" y2="132.3852104848077" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="132.3852104848077" x2="766" y2="132.3852104848077" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="129.73411761543542" x2="95" y2="129.73411761543542" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="129.73411761543542" x2="766" y2="129.73411761543542" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="127.43763651511901" x2="95" y2="127.43763651511901" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="127.43763651511901" x2="766" y2="127.43763651511901" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="125.41199662620275" x2="95" y2="125.41199662620275" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="125.41199662620275" x2="766" y2="125.41199662620275" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="123.6" x2="766" y2="123.6" class="grid" />
+  <line x1="91" y1="123.6" x2="98" y2="123.6" class="axis" />
+  <line x1="759" y1="123.6" x2="766" y2="123.6" class="axis" />
+  <text x="79" y="128.6" text-anchor="end" class="">10<tspan dy="-6" font-size="11">4</tspan>
+  </text>
+  <line x1="91" y1="111.67921217170633" x2="95" y2="111.67921217170633" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="111.67921217170633" x2="766" y2="111.67921217170633" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="104.70599831310136" x2="95" y2="104.70599831310136" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="104.70599831310136" x2="766" y2="104.70599831310136" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="99.75842434341268" x2="95" y2="99.75842434341268" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="99.75842434341268" x2="766" y2="99.75842434341268" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="95.92078782829364" x2="95" y2="95.92078782829364" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="95.92078782829364" x2="766" y2="95.92078782829364" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="92.78521048480772" x2="95" y2="92.78521048480772" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="92.78521048480772" x2="766" y2="92.78521048480772" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="90.13411761543543" x2="95" y2="90.13411761543543" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="90.13411761543543" x2="766" y2="90.13411761543543" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="87.83763651511904" x2="95" y2="87.83763651511904" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="87.83763651511904" x2="766" y2="87.83763651511904" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="85.81199662620273" x2="95" y2="85.81199662620273" class="axis" stroke-width="0.4" />
+  <line x1="762" y1="85.81199662620273" x2="766" y2="85.81199662620273" class="axis" stroke-width="0.4" />
+  <line x1="91" y1="84.0" x2="766" y2="84.0" class="grid" />
+  <line x1="91" y1="84.0" x2="98" y2="84.0" class="axis" />
+  <line x1="759" y1="84.0" x2="766" y2="84.0" class="axis" />
+  <text x="79" y="89.0" text-anchor="end" class="">10<tspan dy="-6" font-size="11">5</tspan>
+  </text>
+  <line x1="101.88709677419355" y1="275" x2="101.88709677419355" y2="282" class="axis" />
+  <line x1="101.88709677419355" y1="84" x2="101.88709677419355" y2="91" class="axis" />
+  <text x="101.88709677419355" y="306" text-anchor="middle" class="">1</text>
+  <line x1="145.43548387096774" y1="275" x2="145.43548387096774" y2="282" class="axis" />
+  <line x1="145.43548387096774" y1="84" x2="145.43548387096774" y2="91" class="axis" />
+  <text x="145.43548387096774" y="306" text-anchor="middle" class="">5</text>
+  <line x1="199.8709677419355" y1="275" x2="199.8709677419355" y2="282" class="axis" />
+  <line x1="199.8709677419355" y1="84" x2="199.8709677419355" y2="91" class="axis" />
+  <text x="199.8709677419355" y="306" text-anchor="middle" class="">10</text>
+  <line x1="417.61290322580646" y1="275" x2="417.61290322580646" y2="282" class="axis" />
+  <line x1="417.61290322580646" y1="84" x2="417.61290322580646" y2="91" class="axis" />
+  <text x="417.61290322580646" y="306" text-anchor="middle" class="">30</text>
+  <line x1="744.2258064516129" y1="275" x2="744.2258064516129" y2="282" class="axis" />
+  <line x1="744.2258064516129" y1="84" x2="744.2258064516129" y2="91" class="axis" />
+  <text x="744.2258064516129" y="306" text-anchor="middle" class="">60</text>
+  <line x1="91.0" y1="278" x2="91.0" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="91.0" y1="84" x2="91.0" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="254.30645161290323" y1="278" x2="254.30645161290323" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="254.30645161290323" y1="84" x2="254.30645161290323" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="308.741935483871" y1="278" x2="308.741935483871" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="308.741935483871" y1="84" x2="308.741935483871" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="363.1774193548387" y1="278" x2="363.1774193548387" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="363.1774193548387" y1="84" x2="363.1774193548387" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="472.0483870967742" y1="278" x2="472.0483870967742" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="472.0483870967742" y1="84" x2="472.0483870967742" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="526.483870967742" y1="278" x2="526.483870967742" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="526.483870967742" y1="84" x2="526.483870967742" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="580.9193548387098" y1="278" x2="580.9193548387098" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="580.9193548387098" y1="84" x2="580.9193548387098" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="635.3548387096774" y1="278" x2="635.3548387096774" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="635.3548387096774" y1="84" x2="635.3548387096774" y2="88" class="axis" stroke-width="0.4" />
+  <line x1="689.7903225806451" y1="278" x2="689.7903225806451" y2="282" class="axis" stroke-width="0.4" />
+  <line x1="689.7903225806451" y1="84" x2="689.7903225806451" y2="88" class="axis" stroke-width="0.4" />
+  <rect x="91" y="84" width="675" height="198" fill="none" stroke="#111" stroke-width="0.8" />
+  <text x="428" y="334" text-anchor="middle" class="label">workload virtual duration (seconds)</text>
+  <text x="26" y="184" text-anchor="middle" class="label" transform="rotate(-90 26 184)">wall-clock elapsed time (ms)</text>
+  <polyline points="101.89,163.20 107.33,156.23 112.77,151.28 118.22,147.44 123.66,144.31 129.10,141.65 134.55,139.36 139.99,137.33 145.44,135.52 150.88,133.88 156.32,132.39 161.77,131.01 167.21,129.73 172.65,128.55 178.10,127.44 183.54,126.40 188.98,125.41 194.43,124.48 199.87,123.60 205.31,122.76 210.76,121.96 216.20,121.20 221.65,120.46 227.09,119.76 232.53,119.09 237.98,118.44 243.42,117.81 248.86,117.21 254.31,116.63 259.75,116.06 265.19,115.52 270.64,114.99 276.08,114.47 281.52,113.98 286.97,113.49 292.41,113.02 297.85,112.56 303.30,112.11 308.74,111.68 314.19,111.25 319.63,110.84 325.07,110.44 330.52,110.04 335.96,109.65 341.40,109.28 346.85,108.91 352.29,108.54 357.73,108.19 363.18,107.84 368.62,107.50 374.06,107.17 379.51,106.84 384.95,106.52 390.40,106.20 395.84,105.89 401.28,105.59 406.73,105.29 412.17,105.00 417.61,104.71 423.06,104.42 428.50,104.14 433.94,103.87 439.39,103.60 444.83,103.33 450.27,103.07 455.72,102.81 461.16,102.55 466.60,102.30 472.05,102.05 477.49,101.81 482.94,101.57 488.38,101.33 493.82,101.10 499.27,100.87 504.71,100.64 510.15,100.42 515.60,100.19 521.04,99.97 526.48,99.76 531.93,99.54 537.37,99.33 542.81,99.13 548.26,98.92 553.70,98.72 559.15,98.51 564.59,98.32 570.03,98.12 575.48,97.92 580.92,97.73 586.36,97.54 591.81,97.35 597.25,97.17 602.69,96.98 608.14,96.80 613.58,96.62 619.02,96.44 624.47,96.27 629.91,96.09 635.35,95.92 640.80,95.75 646.24,95.58 651.69,95.41 657.13,95.25 662.57,95.08 668.02,94.92 673.46,94.76 678.90,94.60 684.35,94.44 689.79,94.28 695.23,94.13 700.68,93.97 706.12,93.82 711.56,93.67 717.01,93.52 722.45,93.37 727.90,93.22 733.34,93.07 738.78,92.93 744.23,92.79" fill="none" stroke-width="2.2" stroke-linejoin="round" stroke-dasharray="none" class="native" />
+  <polyline points="101.89,240.04 744.23,240.04" fill="none" stroke-width="2.2" stroke-linejoin="round" stroke-dasharray="7 6" class="reference" />
+  <rect x="98.38709677419355" y="159.7" width="7" height="7" fill="#3188bd" stroke="#3188bd" stroke-width="1.3" />
+  <circle cx="101.88709677419355" cy="240.04445280332965" r="3.8" fill="white" stroke="#c4382b" stroke-width="1.3" />
+  <rect x="141.93548387096774" y="132.02078782829366" width="7" height="7" fill="#3188bd" stroke="#3188bd" stroke-width="1.3" />
+  <circle cx="145.43548387096774" cy="240.04445280332965" r="3.8" fill="white" stroke="#c4382b" stroke-width="1.3" />
+  <rect x="196.3709677419355" y="120.1" width="7" height="7" fill="#3188bd" stroke="#3188bd" stroke-width="1.3" />
+  <circle cx="199.8709677419355" cy="240.04445280332965" r="3.8" fill="white" stroke="#c4382b" stroke-width="1.3" />
+  <rect x="414.11290322580646" y="101.20599831310136" width="7" height="7" fill="#3188bd" stroke="#3188bd" stroke-width="1.3" />
+  <circle cx="417.61290322580646" cy="240.04445280332965" r="3.8" fill="white" stroke="#c4382b" stroke-width="1.3" />
+  <rect x="740.7258064516129" y="89.28521048480772" width="7" height="7" fill="#3188bd" stroke="#3188bd" stroke-width="1.3" />
+  <circle cx="744.2258064516129" cy="240.04445280332965" r="3.8" fill="white" stroke="#c4382b" stroke-width="1.3" />
+  <text x="470" y="228.04445280332965" text-anchor="start" class="note accent">872× at 10s; 11.47 ms reference</text>
+  <rect x="196.3709677419355" y="120.0984401876429" width="7" height="7" fill="white" stroke="#3188bd" stroke-width="1.3" />
+  <text x="91" y="363" text-anchor="start" class="note">Supervised measurement unavailable; dashed curve is illustrative, not observed.</text>
+  <text x="91" y="385" text-anchor="start" class="small muted">Logarithmic Y axis. Reference exceeds 800× at plotted durations ≥10s.</text>
+</svg>
