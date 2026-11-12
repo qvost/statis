@@ -1,0 +1,72 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="320" viewBox="0 0 800 320" role="img" aria-labelledby="title description">
+  <title id="title">Determinism capability matrix</title>
+  <desc id="description">Paper-style capability table with pale red cells for supported features. Native Linux, Mozilla rr and Meta Hermit require neither kernel modifications nor source recompilation. rr, Hermit and statis handle RDTSC. Unknown properties are marked ?.</desc>
+  <style>
+            :root { color-scheme: only light; }
+            text { font-family: 'Times New Roman', 'Liberation Serif', 'Nimbus Roman', serif;
+                   fill: #111; font-size: 17px; font-weight: 400; }
+            .small { font-size: 13px; }
+            .note { font-size: 14px; }
+            .label { font-size: 21px; }
+            .muted { fill: #444; }
+            .grid { stroke: #c9c9c9; stroke-width: 0.5; }
+            .axis { stroke: #111; stroke-width: 0.8; }
+            .native { stroke: #3188bd; }
+            .reference, .measured { stroke: #c4382b; }
+            .accent { fill: #c4382b; }
+        </style>
+  <rect x="0" y="0" width="800" height="320" fill="white" />
+  <line x1="24" y1="22" x2="768" y2="22" class="axis" stroke-width="1.6" />
+  <text x="24" y="49" text-anchor="start" class="">Capability</text>
+  <text x="386" y="49" text-anchor="middle" class="">Native Linux</text>
+  <text x="495" y="49" text-anchor="middle" class="">Mozilla rr</text>
+  <text x="604" y="49" text-anchor="middle" class="">Meta Hermit</text>
+  <text x="713" y="49" text-anchor="middle" class="">statis</text>
+  <line x1="24" y1="62" x2="768" y2="62" class="axis" stroke-width="0.8" />
+  <text x="24" y="91" text-anchor="start" class="">Zero Kernel Modifications</text>
+  <rect x="337" y="72" width="98" height="27" fill="#f0cfcb" />
+  <text x="386" y="91" text-anchor="middle" class="">Yes</text>
+  <rect x="446" y="72" width="98" height="27" fill="#f0cfcb" />
+  <text x="495" y="91" text-anchor="middle" class="">Yes</text>
+  <rect x="555" y="72" width="98" height="27" fill="#f0cfcb" />
+  <text x="604" y="91" text-anchor="middle" class="">Yes</text>
+  <rect x="664" y="72" width="98" height="27" fill="#f0cfcb" />
+  <text x="713" y="91" text-anchor="middle" class="">Yes</text>
+  <text x="24" y="123" text-anchor="start" class="">Zero Source Recompilation</text>
+  <rect x="337" y="104" width="98" height="27" fill="#f0cfcb" />
+  <text x="386" y="123" text-anchor="middle" class="">Yes</text>
+  <rect x="446" y="104" width="98" height="27" fill="#f0cfcb" />
+  <text x="495" y="123" text-anchor="middle" class="">Yes</text>
+  <rect x="555" y="104" width="98" height="27" fill="#f0cfcb" />
+  <text x="604" y="123" text-anchor="middle" class="">Yes</text>
+  <rect x="664" y="104" width="98" height="27" fill="#f0cfcb" />
+  <text x="713" y="123" text-anchor="middle" class="">Yes</text>
+  <text x="24" y="155" text-anchor="start" class="">Instant Time-Warping (&gt;500×)</text>
+  <text x="386" y="155" text-anchor="middle" class="">No</text>
+  <text x="495" y="155" text-anchor="middle" class="">?</text>
+  <text x="604" y="155" text-anchor="middle" class="">?</text>
+  <text x="713" y="155" text-anchor="middle" class="">?</text>
+  <text x="24" y="187" text-anchor="start" class="">Kilobyte Trace Footprint</text>
+  <text x="386" y="187" text-anchor="middle" class="">—</text>
+  <text x="495" y="187" text-anchor="middle" class="">?</text>
+  <text x="604" y="187" text-anchor="middle" class="">?</text>
+  <text x="713" y="187" text-anchor="middle" class="">?</text>
+  <text x="24" y="219" text-anchor="start" class="">Hardware RDTSC Trap &amp; Emulate</text>
+  <text x="386" y="219" text-anchor="middle" class="">No</text>
+  <rect x="446" y="200" width="98" height="27" fill="#f0cfcb" />
+  <text x="495" y="219" text-anchor="middle" class="">Yes</text>
+  <rect x="555" y="200" width="98" height="27" fill="#f0cfcb" />
+  <text x="604" y="219" text-anchor="middle" class="">Yes</text>
+  <rect x="664" y="200" width="98" height="27" fill="#f0cfcb" />
+  <text x="713" y="219" text-anchor="middle" class="">Yes</text>
+  <text x="24" y="251" text-anchor="start" class="">Seeded Deterministic Fault Injection</text>
+  <text x="386" y="251" text-anchor="middle" class="">No</text>
+  <text x="495" y="251" text-anchor="middle" class="">?</text>
+  <text x="604" y="251" text-anchor="middle" class="">?</text>
+  <rect x="664" y="232" width="98" height="27" fill="#f0cfcb" />
+  <text x="713" y="251" text-anchor="middle" class="">Yes</text>
+  <line x1="24" y1="268" x2="768" y2="268" class="axis" stroke-width="1.6" />
+  <text x="24" y="290" text-anchor="start" class="note">Shading = documented or implemented support; ? = unverified; — = not applicable.</text>
+  <text x="24" y="312" text-anchor="start" class="small muted">Speed and size depend on workload. Sources and runtime limits: docs/benchmarking.md.</text>
+</svg>

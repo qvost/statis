@@ -15,6 +15,39 @@ Concurrent programs depend on inputs that are difficult to reproduce:
 
 `statis` controls selected inputs using seccomp notifications, ptrace, and a seeded ChaCha20 generator. Reproducibility depends on which operations the target uses; a fixed seed does not yet control every userspace instruction interleaving.
 
+## Benchmarks & Performance
+
+Run the portable Python 3 harness to build release fixtures, compare native and supervised execution, record trace size, and regenerate the charts. No pip dependencies are needed.
+
+```bash
+python3 scripts/benchmarks.py
+```
+
+The default run reports medians of three fresh processes per mode, including startup overhead. Raw samples, diagnostics, and host details are saved to [docs/benchmark_results.json](docs/benchmark_results.json). Use `--samples 1` for a shorter run, `--bin-dir target/release` for prebuilt binaries, or `--strict` to fail CI on incomplete measurements. See the [methodology and comparison sources](docs/benchmarking.md#automated-benchmark-harness).
+
+Latest empirical results on this host:
+
+| Workload | Native median | statis median / size | Measured speedup |
+| --- | ---: | --- | ---: |
+| `test_timewarp` · 10s nanosleep | 10,000.907 ms | Unavailable: launch failed | — |
+| `test_epoll` · 15s epoll timeout | 15,016.036 ms | Unavailable: launch failed | — |
+| `test_concurrency` · 4-thread mutex | 0.849 ms | Unavailable: launch failed | — |
+| `test_record_replay` · trace storage | — | Unavailable: recording failed | — |
+
+This host's supervised runs exited before target exec; the saved report is **incomplete**. These failures do not establish a speedup or trace saving. Rerun on a host that permits the required tracing operations to populate measured values.
+
+![Time Warp Speedup](benchmarks_svg/time_warp_speedup.svg)
+
+The dashed **872× reference** corresponds to a 10,000 ms sleep completing in 11.47 ms. The native curve uses ideal durations; measured points appear separately when available. The reference is illustrative, and the harness calculates actual speedups from completed runs.
+
+![Trace Storage Footprint](benchmarks_svg/trace_size_comparison.svg)
+
+The supplied storage references—45,200 KB for rr, 1,250 KB for Hermit, and 0.14 KB (140 bytes) for statis—illustrate approximately **320,000×** reduction. They are not matched-workload measurements. The harness separately reports the actual fixture size and compares it with an assumed rr rate of ~45 MB/min. Kilobyte savings and a 140-byte trace are unverified; the current binary event format does not implement delta serialization.
+
+![Competitive Matrix](benchmarks_svg/determinism_matrix.svg)
+
+The matrix marks documented or implemented capabilities and leaves unmeasured properties explicit. The charts use a white page, serif typography, thin axes, and red/blue marks in the supplied reference style. To regenerate the SVGs in `benchmarks_svg/` from saved results, run `python3 scripts/generate_charts.py`.
+
 ## How it works
 
 ### Isolation boundary
@@ -73,7 +106,7 @@ cargo build --bins
 
 The summary reports virtual seconds and elapsed seconds separately. Its `Virtual / elapsed` ratio describes how much virtual time advanced per elapsed second; it is not a comparison against an unsupervised execution.
 
-Current benchmark attempts and host restrictions are recorded in [docs/benchmarking.md](docs/benchmarking.md). No target latency is claimed without a completed run.
+Current benchmark attempts and host restrictions are recorded in [docs/benchmarking.md](docs/benchmarking.md). No supervised target latency is claimed without a completed run.
 
 ### Deterministic fault injection
 
@@ -118,6 +151,16 @@ tests/
   test_fault_injection.rs  I/O fault fixture
   test_process_tree.rs     Process identity fixture
   test_record_replay.rs    Record/replay fixture
+
+scripts/
+  benchmarks.py           Native/supervised timings and trace-size measurement
+  generate_charts.py      Standard-library SVG generation from saved results
+  test_benchmarks.py      Harness failure-handling regression checks
+
+docs/
+  benchmark_results.json  Raw benchmark results and host metadata
+
+benchmarks_svg/           Generated paper-style SVG charts
 ```
 
 ## Running tests
