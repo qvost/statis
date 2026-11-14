@@ -11,7 +11,7 @@ env:
 
 jobs:
   test:
-    name: Build & Test
+    name: Rust Build & Test
     runs-on: ubuntu-latest
 
     steps:
@@ -45,3 +45,38 @@ jobs:
 
       - name: Build All Binaries
         run: cargo build --release --all-targets
+
+  portal-and-scripts:
+    name: Portal & Scripts Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Benchmark Harness Tests
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+
+      - name: Install Portal Dependencies
+        run: npm --prefix portal install
+
+      - name: Sync Portal Assets
+        run: npm --prefix portal run sync
+
+      - name: Typecheck Portal
+        run: npm --prefix portal run typecheck
+
+      - name: Run Portal Tests
+        run: npm --prefix portal test
