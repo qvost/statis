@@ -78,5 +78,8 @@ jobs:
       - name: Typecheck Portal
         run: npm --prefix portal run typecheck
 
+      - name: Build Portal
+        run: npm --prefix portal run build
+
       - name: Run Portal Tests
         run: npm --prefix portal test
